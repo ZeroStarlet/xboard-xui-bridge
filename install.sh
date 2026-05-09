@@ -146,6 +146,17 @@ After=network.target
 [Service]
 Type=simple
 User=root
+# BRIDGE_LISTEN_ADDR=:8787 让 Web 面板绑定全部网卡——VPS 一键安装的
+# 典型场景就是要从公网浏览器访问。安全模型靠 admin 鉴权 + bcrypt +
+# CSRF 防御兜底；如需更高安全请配反代 + TLS。
+#
+# 不希望外部可达的运维可以执行：
+#   sudo systemctl edit xboard-xui-bridge
+# 然后写：
+#   [Service]
+#   Environment=BRIDGE_LISTEN_ADDR=127.0.0.1:8787
+# 这会通过 drop-in override 覆盖以下默认值。
+Environment=BRIDGE_LISTEN_ADDR=:8787
 ExecStart=${BIN_PATH} run --db ${DATA_DIR}/bridge.db
 Restart=on-failure
 RestartSec=5s
@@ -198,6 +209,11 @@ show_post_install() {
     else
         echo "  初始密码：      （未读到 initial_password.txt——这通常意味着升级安装，沿用旧密码）"
     fi
+    echo ""
+    echo "  防火墙放行（首次部署必做）："
+    echo "    ufw allow 8787/tcp                                                # Ubuntu/Debian"
+    echo "    firewall-cmd --add-port=8787/tcp --permanent && firewall-cmd --reload   # CentOS/RHEL"
+    echo "    云厂商 VPS 还需到控制台安全组放行 TCP 8787。"
     echo ""
     echo "  服务管理命令："
     echo "    systemctl status ${SERVICE_NAME}    查看运行状态"
