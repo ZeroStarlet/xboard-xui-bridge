@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>xboard-xui-bridge</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", sans-serif;
+      max-width: 720px;
+      margin: 80px auto;
+      padding: 0 24px;
+      line-height: 1.6;
+      color: #1f2937;
+      background: #f9fafb;
+    }
+    h1 { font-size: 24px; margin-bottom: 8px; }
+    .stage { color: #2563eb; font-weight: 600; }
+    code { background: #e5e7eb; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
+    .box {
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 20px;
+      margin-top: 16px;
+    }
+    ul { padding-left: 20px; }
+    li { margin: 4px 0; }
+    .muted { color: #6b7280; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>xboard-xui-bridge</h1>
+  <p class="muted">v0.2 升级中：当前阶段 <span class="stage">M5（Web 后端）已完成</span>，前端 SPA（M6）尚未构建。</p>
+
+  <div class="box">
+    <h2>下一步</h2>
+    <p>本页是 <code>internal/web/dist/index.html</code> 的占位文件，让 Go 端的 <code>//go:embed</code> 在前端尚未构建时也能成功编译。</p>
+    <p>等 M6 阶段引入 Vue 3 + Vite 工程后，<code>make web</code> 命令会构建并替换该文件。届时您打开本地址将看到完整的管理面板（仪表盘、桥接管理、设置、账户）。</p>
+  </div>
+
+  <div class="box">
+    <h2>已可用的后端 API</h2>
+    <ul>
+      <li><code>POST /api/auth/login</code> 登录（接收 <code>{username, password}</code>）</li>
+      <li><code>POST /api/auth/logout</code> 登出</li>
+      <li><code>GET  /api/auth/me</code> 当前用户</li>
+      <li><code>PUT  /api/account/password</code> 改密</li>
+      <li><code>GET  /api/settings</code> 全部运行参数（脱敏）</li>
+      <li><code>PATCH /api/settings</code> 部分更新（触发引擎热重载）</li>
+      <li><code>GET  /api/bridges</code> 列出桥接</li>
+      <li><code>POST /api/bridges</code> 新增桥接</li>
+      <li><code>PUT  /api/bridges/{name}</code> 更新桥接</li>
+      <li><code>DELETE /api/bridges/{name}</code> 删除桥接</li>
+      <li><code>GET  /api/status</code> 引擎状态摘要</li>
+      <li><code>GET  /api/health</code> 存活探针</li>
+    </ul>
+    <p class="muted">所有写操作要求带有效的 <code>bridge_session</code> cookie + Origin/Referer 同源校验。</p>
+  </div>
+
+  <div class="box">
+    <h2>临时操作建议</h2>
+    <p>在 M6 完成前，运维可以：</p>
+    <ul>
+      <li>用 <code>curl</code> + cookie 调试上述 API；</li>
+      <li>或直接 <code>sqlite3 ./data/bridge.db</code> 编辑 settings / bridges 表后重启进程。</li>
+    </ul>
+  </div>
+</body>
+</html>

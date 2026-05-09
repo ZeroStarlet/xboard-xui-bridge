@@ -1,30 +1,39 @@
 // Package config 定义 xboard-xui-bridge 的配置模型与加载流程。
 //
-// 设计原则：
+// 设计原则（v0.2 起，"零 yaml" 阶段）：
 //
-//  1. 配置在进程启动时一次性加载并完成校验；运行期间不支持热加载，避免
-//     "部分组件已切换到新配置、其他组件仍在旧配置"导致的状态不一致。
-//  2. 默认值在 Validate 中显式补齐——绝不依赖 YAML 解析时的零值表达
-//     "未指定"语义，因为零值与"显式写 0"无法区分（如 Interval=0 不能默认 60s）。
-//  3. 任何新增配置项都必须同时：a) 写明 yaml tag；b) 在 Validate 中校验；
-//     c) 在 configs/config.example.yaml 中给出注释样例。三处缺一会导致
-//     用户配置静默失效，违反"显式优于隐式"的项目铁律。
+//  1. 配置真相源是 SQLite 中的 settings / bridges 两张表（详见
+//     internal/store/schema.go）；不再读取任何 YAML 文件——v0.1 时代的
+//     config.yaml 完全废弃。
+//  2. 进程启动时一次性从 store 加载并完成校验；运行期间通过
+//     internal/supervisor 协调"全停全启"式重载，避免"部分组件已切换到新
+//     配置、其他组件仍在旧配置"导致的状态不一致。
+//  3. 默认值在 Validate 中显式补齐——绝不依赖结构体零值表达"未指定"语义，
+//     因为零值与"显式写 0"无法区分（如 Interval=0 不能默认 60s）。
+//  4. "首次启动 / 半填" 友好：xboard / xui 关键字段允许为空，引擎空载运行
+//     等待 GUI 填写完成后调用 Supervisor.Reload；非空字段仍按原规则严格
+//     校验格式（避免"填错一半"被静默接受）。
+//  5. 任何新增配置项都必须同时：a) 声明 SettingXxx 常量；b) 在
+//     LoadFromStore 中映射；c) 在 Validate 中校验或补默认；d) 在 Web
+//     Handler 表单层补上"必填"校验。四处缺一会导致用户配置静默失效，
+//     违反"显式优于隐式"的项目铁律。
 //
 // 不在本包做的事：
 //
-//	不做"读取 + 启动"的副作用（不创建文件、不打开网络连接），只做纯解析与
-//	校验。这样测试只需构造 Root 结构体即可覆盖所有分支。
+//	不创建数据库、不打开网络连接，仅做"从 store 读取 → 解码 → 校验 → 返回"
+//	纯计算流程。这样测试只需构造内存 store 即可覆盖所有分支。
 package config
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/url"
-	"os"
+	"strconv"
 	"strings"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	"github.com/xboard-bridge/xboard-xui-bridge/internal/store"
 )
 
 // 协议常量。中间件内部一律使用这套小写字符串作为协议标识，避免大小写歧义。
@@ -63,53 +72,115 @@ const (
 	XuiAuthModeToken = "token"
 )
 
+// settings 表 key 常量。
+//
+// 命名约定 "<group>.<field>"，与 v0.1 时代的 yaml 字段名一一对应；这样
+// 阅读旧文档与新数据库时心智映射零成本。集中声明的目的是避免散落字符串
+// 拼写漂移——M2 / M5 / M7 三处都引用这些常量，缺一处都可能让用户写入的
+// 字段被误读成 "未设置"。
+const (
+	// log 组
+	SettingLogLevel      = "log.level"
+	SettingLogFile       = "log.file"
+	SettingLogMaxSizeMB  = "log.max_size_mb"
+	SettingLogMaxBackups = "log.max_backups"
+	SettingLogMaxAgeDays = "log.max_age_days"
+
+	// xboard 组
+	SettingXboardAPIHost       = "xboard.api_host"
+	SettingXboardToken         = "xboard.token"
+	SettingXboardTimeoutSec    = "xboard.timeout_sec"
+	SettingXboardSkipTLSVerify = "xboard.skip_tls_verify"
+	SettingXboardUserAgent     = "xboard.user_agent"
+
+	// xui 组
+	SettingXuiAPIHost       = "xui.api_host"
+	SettingXuiBasePath      = "xui.base_path"
+	SettingXuiAuthMode      = "xui.auth_mode"
+	SettingXuiAPIToken      = "xui.api_token"
+	SettingXuiTimeoutSec    = "xui.timeout_sec"
+	SettingXuiSkipTLSVerify = "xui.skip_tls_verify"
+
+	// intervals 组
+	SettingIntervalsUserPullSec    = "intervals.user_pull_sec"
+	SettingIntervalsTrafficPushSec = "intervals.traffic_push_sec"
+	SettingIntervalsAlivePushSec   = "intervals.alive_push_sec"
+	SettingIntervalsStatusPushSec  = "intervals.status_push_sec"
+
+	// reporting 组
+	SettingReportingAliveEnabled  = "reporting.alive_enabled"
+	SettingReportingStatusEnabled = "reporting.status_enabled"
+
+	// web 组
+	SettingWebListenAddr               = "web.listen_addr"
+	SettingWebSessionMaxAgeHours       = "web.session_max_age_hours"
+	SettingWebAbsoluteMaxLifetimeHours = "web.absolute_max_lifetime_hours"
+)
+
+// 默认值常量。值的选择动机详见 Validate 中各分支注释。
+const (
+	defaultLogLevel             = "info"
+	defaultXboardTimeoutSec     = 15
+	defaultXboardUserAgent      = "xboard-xui-bridge"
+	defaultXuiTimeoutSec        = 15
+	defaultIntervalSec          = 60 // 与 Xboard 推荐周期一致
+	minIntervalSec              = 5  // 防止配置错把面板打挂
+	defaultWebListenAddr        = "127.0.0.1:8787"
+	defaultWebSessionMaxHours   = 24 * 7  // 7 天滑动窗口
+	defaultWebAbsoluteMaxHours  = 24 * 30 // 30 天绝对上限
+)
+
 // Root 是配置文件的根节点。
 //
 // 嵌套结构而不是平铺：因为各部分互不耦合，嵌套能让每个组件只接收自己关心
 // 的子配置（如 logger.New(cfg.Log)），保持单一职责。
 type Root struct {
-	Log       Log       `yaml:"log"`
-	State     State     `yaml:"state"`
-	Xboard    Xboard    `yaml:"xboard"`
-	Xui       Xui       `yaml:"xui"`
-	Bridges   []Bridge  `yaml:"bridges"`
-	Intervals Intervals `yaml:"intervals"`
-	Reporting Reporting `yaml:"reporting"`
+	Log       Log
+	State     State
+	Xboard    Xboard
+	Xui       Xui
+	Bridges   []Bridge
+	Intervals Intervals
+	Reporting Reporting
+	Web       Web
 }
 
 // Log 描述日志输出策略。
 type Log struct {
 	// Level：debug / info / warn / error。大小写不敏感，规范化在 Validate 完成。
-	Level string `yaml:"level"`
+	Level string
 	// File：写入路径；空字符串表示 stdout。文件不存在时 logger 会自动创建。
-	File string `yaml:"file"`
+	File string
 	// MaxSizeMB：单文件滚动阈值（MB），仅在 File 非空时生效。0 视为不滚动。
-	MaxSizeMB int `yaml:"max_size_mb"`
+	MaxSizeMB int
 	// MaxBackups：保留历史日志份数，超过即清理最旧的。
-	MaxBackups int `yaml:"max_backups"`
+	MaxBackups int
 	// MaxAgeDays：历史日志最大保留天数，超过即清理。
-	MaxAgeDays int `yaml:"max_age_days"`
+	MaxAgeDays int
 }
 
-// State 描述本地状态持久层（流量基线、失败重传队列）。
+// State 描述本地状态持久层（流量基线、settings、bridges、admin、sessions）。
+//
+// 注意：Database 字段不通过 settings 表传递——它是打开 SQLite 时就需要
+// 的"鸡生蛋"前置参数，由 main.go 通过命令行 flag / 环境变量决定后传给
+// store.OpenSQLite，并在 LoadFromStore 时回填到本字段，便于其它组件
+// 通过统一接口取得。
 type State struct {
-	// Database：SQLite 文件路径；建议放在 /var/lib/xboard-bridge/bridge.db
-	// 等持久卷下，避免随容器临时层销毁。
-	Database string `yaml:"database"`
+	Database string
 }
 
 // Xboard 描述对 Xboard 节点 API 的访问参数。
 type Xboard struct {
 	// APIHost：Xboard 面板入口（含协议头），例如 https://panel.example.com，结尾不必带 /。
-	APIHost string `yaml:"api_host"`
+	APIHost string
 	// Token：admin_setting('server_token')，所有 V2 节点 API 鉴权使用同一个 token。
-	Token string `yaml:"token"`
+	Token string
 	// TimeoutSec：单次 HTTP 请求超时秒数，包括连接 + 读取 + 关闭。
-	TimeoutSec int `yaml:"timeout_sec"`
+	TimeoutSec int
 	// SkipTLSVerify：仅自签证书的内网部署可设 true；公网部署严禁开启。
-	SkipTLSVerify bool `yaml:"skip_tls_verify"`
-	// UserAgent：请求头标识，默认 xboard-xui-bridge/<version>。便于 Xboard 侧访问日志识别。
-	UserAgent string `yaml:"user_agent"`
+	SkipTLSVerify bool
+	// UserAgent：请求头标识，默认 xboard-xui-bridge。便于 Xboard 侧访问日志识别。
+	UserAgent string
 }
 
 // Xui 描述对 3x-ui 面板 API 的访问参数。
@@ -118,20 +189,19 @@ type Xboard struct {
 // cookie 登录模式因 CSRF 复杂性已被移除，详见 XuiAuthModeToken 注释。
 type Xui struct {
 	// APIHost：3x-ui 面板根 URL（含协议头），例如 http://127.0.0.1:2053。
-	APIHost string `yaml:"api_host"`
+	APIHost string
 	// BasePath：3x-ui 的 webBasePath 设置；空串代表 /。
 	// 中间件会在 APIHost 之后、/panel/api/... 之前拼接它。
-	BasePath string `yaml:"base_path"`
-	// AuthMode：保留字段；当前唯一合法取值为 "token"，写其他值会被
-	// Validate 拒绝。保留是为了未来若再扩展鉴权方式时不破坏配置兼容。
-	AuthMode string `yaml:"auth_mode"`
+	BasePath string
+	// AuthMode：保留字段；当前唯一合法取值为 "token"。
+	AuthMode string
 	// APIToken：3x-ui 后台生成的 48 字符 API Token。
-	APIToken string `yaml:"api_token"`
+	APIToken string
 	// TimeoutSec：单次 HTTP 请求超时秒数。
-	TimeoutSec int `yaml:"timeout_sec"`
+	TimeoutSec int
 	// SkipTLSVerify：3x-ui 多数部署在 127.0.0.1，但少数会暴露到公网，
 	// 内网用自签可放行，公网严禁。
-	SkipTLSVerify bool `yaml:"skip_tls_verify"`
+	SkipTLSVerify bool
 }
 
 // Bridge 描述一对 (Xboard 节点, 3x-ui inbound) 的映射关系。
@@ -140,21 +210,21 @@ type Xui struct {
 // 互不干扰。Bridge 之间共享同一份 Xboard / Xui 客户端实例（连接复用）。
 type Bridge struct {
 	// Name：人类可读名称，用于日志区分；同一配置内必须唯一。
-	Name string `yaml:"name"`
+	Name string
 	// XboardNodeID：在 Xboard 后台为该节点分配的数字 ID。
-	XboardNodeID int `yaml:"xboard_node_id"`
+	XboardNodeID int
 	// XboardNodeType：Xboard 端节点类型，用于 V2 API 的 node_type 参数。
 	// 注意：当 Xboard 节点类型是 hysteria 时，本字段填 hysteria；
 	// 至于实际是 v1 还是 v2，由 Protocol 字段决定（业务语义解耦）。
-	XboardNodeType string `yaml:"xboard_node_type"`
+	XboardNodeType string
 	// XuiInboundID：在 3x-ui 侧已经创建好的 inbound 数字 ID（管理员预创建）。
-	XuiInboundID int `yaml:"xui_inbound_id"`
+	XuiInboundID int
 	// Protocol：见 ProtocolXxx 常量；决定协议适配器选择。
-	Protocol string `yaml:"protocol"`
+	Protocol string
 	// Flow：仅 VLESS 协议生效，常见取值 xtls-rprx-vision；其他协议忽略。
-	Flow string `yaml:"flow"`
+	Flow string
 	// Enable：false 时该 Bridge 不参与同步循环（用于灰度 / 临时停用）。
-	Enable bool `yaml:"enable"`
+	Enable bool
 }
 
 // Intervals 描述四个同步循环的执行间隔（秒）。
@@ -162,10 +232,10 @@ type Bridge struct {
 // 默认全部 60s 与 Xboard 推荐一致；调高会降低面板压力但延长响应延迟，
 // 调低则相反。所有 Bridge 共享同一组间隔，避免运维心智负担。
 type Intervals struct {
-	UserPullSec    int `yaml:"user_pull_sec"`
-	TrafficPushSec int `yaml:"traffic_push_sec"`
-	AlivePushSec   int `yaml:"alive_push_sec"`
-	StatusPushSec  int `yaml:"status_push_sec"`
+	UserPullSec    int
+	TrafficPushSec int
+	AlivePushSec   int
+	StatusPushSec  int
 }
 
 // Reporting 描述上报开关。
@@ -179,34 +249,113 @@ type Intervals struct {
 //	因此倍率统一在 Xboard 后台节点配置中维护，中间件只上报 raw delta。
 type Reporting struct {
 	// AliveEnabled：是否上报在线 IP（用于 Xboard 设备数限制）。
-	AliveEnabled bool `yaml:"alive_enabled"`
+	AliveEnabled bool
 	// StatusEnabled：是否上报节点 CPU / 内存 / 磁盘负载。
-	StatusEnabled bool `yaml:"status_enabled"`
+	StatusEnabled bool
 }
 
-// LoadFromFile 读取并解析 YAML 文件，随后调用 Validate 完成校验。
+// Web 描述 Web 面板自身的运行参数。
 //
-// 任何错误都被包装上文件路径前缀，便于运维快速定位是哪个配置出问题——
-// 在多实例部署中这能省下大量排查时间。
-func LoadFromFile(path string) (*Root, error) {
-	raw, err := os.ReadFile(path)
+// 注：v0.2 起新增；v0.1 没有 Web 面板时无该字段。
+type Web struct {
+	// ListenAddr：HTTP 监听地址，形如 "127.0.0.1:8787"（默认）或 ":8787"
+	// （绑定全部网卡）。后者仅推荐在配合反向代理 + TLS 时使用。
+	ListenAddr string
+	// SessionMaxAgeHours：滑动续期窗口（小时）。每次有效请求把过期时间推到
+	// "now + SessionMaxAgeHours"。默认 168（7 天）。
+	SessionMaxAgeHours int
+	// AbsoluteMaxLifetimeHours：会话从 created_at 起的绝对寿命上限（小时）。
+	// 默认 720（30 天）。即使滑动续期一直命中，token 总寿命也不会超过该值。
+	AbsoluteMaxLifetimeHours int
+}
+
+// LoadFromStore 从 SQLite 持久层加载完整配置。
+//
+// 调用前必须先 store.OpenSQLite（schema 已就绪）。dbPath 是调用方在打开
+// SQLite 时已经持有的路径，本函数把它回填到 Root.State.Database，便于
+// 其它组件按统一接口取数据库路径。
+//
+// 失败原因：
+//
+//	a) ListSettings / ListBridges 返回数据库错误；
+//	b) Validate 在补默认值后仍发现"非法格式"——如 protocol 取值非法、
+//	   interval 低于 minIntervalSec、bridges 内重复 name 等。
+//
+// "首次启动" 场景：settings 与 bridges 都为空时仍能成功返回——这是有意
+// 设计，让首次部署的运维即使没填任何字段也能进入 Web 面板配置。校验
+// 仅确保 dbPath 非空（"鸡生蛋"必填项）。
+func LoadFromStore(ctx context.Context, st store.Store, dbPath string) (*Root, error) {
+	if st == nil {
+		return nil, errors.New("LoadFromStore: store 不可为 nil")
+	}
+	settings, err := st.ListSettings(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("读取配置文件 %q: %w", path, err)
+		return nil, fmt.Errorf("加载 settings：%w", err)
+	}
+	bridgeRows, err := st.ListBridges(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("加载 bridges：%w", err)
 	}
 
-	var root Root
-	dec := yaml.NewDecoder(strings.NewReader(string(raw)))
-	// KnownFields(true) 让 YAML 中的拼写错误（例如把 timeout_sec 写成 timout_sec）
-	// 立即暴露为解析错误，而不是被静默忽略导致默认值生效——后者是非常危险的运维陷阱。
-	dec.KnownFields(true)
-	if err := dec.Decode(&root); err != nil {
-		return nil, fmt.Errorf("解析配置文件 %q: %w", path, err)
+	root := &Root{
+		Log: Log{
+			Level:      settings[SettingLogLevel],
+			File:       settings[SettingLogFile],
+			MaxSizeMB:  parseSettingInt(settings, SettingLogMaxSizeMB, 0),
+			MaxBackups: parseSettingInt(settings, SettingLogMaxBackups, 0),
+			MaxAgeDays: parseSettingInt(settings, SettingLogMaxAgeDays, 0),
+		},
+		State: State{Database: dbPath},
+		Xboard: Xboard{
+			APIHost:       settings[SettingXboardAPIHost],
+			Token:         settings[SettingXboardToken],
+			TimeoutSec:    parseSettingInt(settings, SettingXboardTimeoutSec, 0),
+			SkipTLSVerify: parseSettingBool(settings, SettingXboardSkipTLSVerify, false),
+			UserAgent:     settings[SettingXboardUserAgent],
+		},
+		Xui: Xui{
+			APIHost:       settings[SettingXuiAPIHost],
+			BasePath:      settings[SettingXuiBasePath],
+			AuthMode:      settings[SettingXuiAuthMode],
+			APIToken:      settings[SettingXuiAPIToken],
+			TimeoutSec:    parseSettingInt(settings, SettingXuiTimeoutSec, 0),
+			SkipTLSVerify: parseSettingBool(settings, SettingXuiSkipTLSVerify, false),
+		},
+		Intervals: Intervals{
+			UserPullSec:    parseSettingInt(settings, SettingIntervalsUserPullSec, 0),
+			TrafficPushSec: parseSettingInt(settings, SettingIntervalsTrafficPushSec, 0),
+			AlivePushSec:   parseSettingInt(settings, SettingIntervalsAlivePushSec, 0),
+			StatusPushSec:  parseSettingInt(settings, SettingIntervalsStatusPushSec, 0),
+		},
+		Reporting: Reporting{
+			AliveEnabled:  parseSettingBool(settings, SettingReportingAliveEnabled, false),
+			StatusEnabled: parseSettingBool(settings, SettingReportingStatusEnabled, false),
+		},
+		Web: Web{
+			ListenAddr:               settings[SettingWebListenAddr],
+			SessionMaxAgeHours:       parseSettingInt(settings, SettingWebSessionMaxAgeHours, 0),
+			AbsoluteMaxLifetimeHours: parseSettingInt(settings, SettingWebAbsoluteMaxLifetimeHours, 0),
+		},
+	}
+
+	// bridges 行表 → []Bridge：纯字段转换。Validate 后续会再做规范化（lower / trim 等）。
+	root.Bridges = make([]Bridge, 0, len(bridgeRows))
+	for _, br := range bridgeRows {
+		root.Bridges = append(root.Bridges, Bridge{
+			Name:           br.Name,
+			XboardNodeID:   br.XboardNodeID,
+			XboardNodeType: br.XboardNodeType,
+			XuiInboundID:   br.XuiInboundID,
+			Protocol:       br.Protocol,
+			Flow:           br.Flow,
+			Enable:         br.Enable,
+		})
 	}
 
 	if err := root.Validate(); err != nil {
-		return nil, fmt.Errorf("校验配置 %q: %w", path, err)
+		return nil, fmt.Errorf("校验配置：%w", err)
 	}
-	return &root, nil
+	return root, nil
 }
 
 // Validate 同时承担"校验非法值"与"补齐默认值"两个职责。
@@ -215,11 +364,23 @@ func LoadFromFile(path string) (*Root, error) {
 // 仍要确认其为正数），分两个函数会重复检查反而增加心智负担。
 //
 // 任何被修改字段都通过指针接收者写回 r，确保后续组件读取到的是已规范化的值。
+//
+// 与 v0.1 yaml 时代的语义放宽点：
+//
+//   - bridges 数量允许为 0：首次启动 / GUI 还未配置时合法；引擎装配出空集合
+//     并阻塞等待 ctx，Supervisor.Reload 收到新 bridges 后再装配 worker。
+//   - 至少 1 项 enabled 不再强制：运维可临时禁用所有桥接做维护。
+//   - xboard.api_host / xboard.token / xui.api_host / xui.api_token 允许为空：
+//     首次启动 GUI 还未填写时合法；非空时仍按原规则校验格式。
+//
+// Web Handler 表单提交路径会做更严格的"必填"校验，这与本函数的宽松校验
+// 互补——前者让用户立刻知道半填错误，后者让运维重启后即使配置不完整也
+// 能进入 Web 面板修复。
 func (r *Root) Validate() error {
 	// ---------------- log ----------------
 	switch strings.ToLower(strings.TrimSpace(r.Log.Level)) {
 	case "":
-		r.Log.Level = "info"
+		r.Log.Level = defaultLogLevel
 	case "debug", "info", "warn", "error":
 		r.Log.Level = strings.ToLower(r.Log.Level)
 	default:
@@ -231,29 +392,34 @@ func (r *Root) Validate() error {
 
 	// ---------------- state ----------------
 	if strings.TrimSpace(r.State.Database) == "" {
-		return errors.New("state.database 必须指定本地 SQLite 文件路径")
+		return errors.New("state.database 必须由调用方在打开 SQLite 时传入（默认 ./data/bridge.db）")
 	}
 
 	// ---------------- xboard ----------------
-	if err := validateHTTPHost("xboard.api_host", r.Xboard.APIHost); err != nil {
-		return err
+	// 空字符串允许：首次启动场景。非空时仍按原规则严格校验。
+	r.Xboard.APIHost = strings.TrimSpace(r.Xboard.APIHost)
+	if r.Xboard.APIHost != "" {
+		if err := validateHTTPHost("xboard.api_host", r.Xboard.APIHost); err != nil {
+			return err
+		}
+		r.Xboard.APIHost = strings.TrimRight(r.Xboard.APIHost, "/")
 	}
-	r.Xboard.APIHost = strings.TrimRight(r.Xboard.APIHost, "/")
-	if strings.TrimSpace(r.Xboard.Token) == "" {
-		return errors.New("xboard.token 不可为空")
-	}
+	r.Xboard.Token = strings.TrimSpace(r.Xboard.Token)
 	if r.Xboard.TimeoutSec <= 0 {
-		r.Xboard.TimeoutSec = 15
+		r.Xboard.TimeoutSec = defaultXboardTimeoutSec
 	}
 	if strings.TrimSpace(r.Xboard.UserAgent) == "" {
-		r.Xboard.UserAgent = "xboard-xui-bridge"
+		r.Xboard.UserAgent = defaultXboardUserAgent
 	}
 
 	// ---------------- xui ----------------
-	if err := validateHTTPHost("xui.api_host", r.Xui.APIHost); err != nil {
-		return err
+	r.Xui.APIHost = strings.TrimSpace(r.Xui.APIHost)
+	if r.Xui.APIHost != "" {
+		if err := validateHTTPHost("xui.api_host", r.Xui.APIHost); err != nil {
+			return err
+		}
+		r.Xui.APIHost = strings.TrimRight(r.Xui.APIHost, "/")
 	}
-	r.Xui.APIHost = strings.TrimRight(r.Xui.APIHost, "/")
 	r.Xui.BasePath = normalizeBasePath(r.Xui.BasePath)
 	switch strings.ToLower(strings.TrimSpace(r.Xui.AuthMode)) {
 	case "", XuiAuthModeToken:
@@ -261,19 +427,15 @@ func (r *Root) Validate() error {
 	default:
 		return fmt.Errorf("xui.auth_mode 取值非法：%q（当前仅支持 token，cookie 模式已移除）", r.Xui.AuthMode)
 	}
-	if strings.TrimSpace(r.Xui.APIToken) == "" {
-		return errors.New("xui.api_token 不可为空（请在 3x-ui 后台生成 API Token）")
-	}
+	r.Xui.APIToken = strings.TrimSpace(r.Xui.APIToken)
 	if r.Xui.TimeoutSec <= 0 {
-		r.Xui.TimeoutSec = 15
+		r.Xui.TimeoutSec = defaultXuiTimeoutSec
 	}
 
 	// ---------------- bridges ----------------
-	if len(r.Bridges) == 0 {
-		return errors.New("bridges 至少需要配置一项")
-	}
+	// 不再强制"至少 1 项"或"至少 1 项 enabled"。每条 bridge 自身字段仍严格校验，
+	// 防止存了一行半填数据进数据库。
 	seenName := make(map[string]struct{}, len(r.Bridges))
-	enabledCount := 0
 	for i := range r.Bridges {
 		b := &r.Bridges[i]
 		// 用指针写回是为了让后续业务代码读取到规范化（trim、小写）后的值。
@@ -316,30 +478,20 @@ func (r *Root) Validate() error {
 		} else {
 			b.Flow = strings.TrimSpace(b.Flow)
 		}
-
-		if b.Enable {
-			enabledCount++
-		}
-	}
-	// 防御漏写 enable: true 导致全部 Bridge 静默禁用。
-	// YAML 中省略 enable 字段时，bool 默认 false——若所有 Bridge 都未显式 enable，
-	// 引擎会启动后立刻挂起在 ctx.Done() 上，运维以为程序在跑实际什么都没做。
-	if enabledCount == 0 {
-		return errors.New("bridges 至少需要一项 enable: true（否则同步引擎不会进行任何工作）")
 	}
 
-	// ---------------- intervals（默认 60s，最低 5s 防止把面板打挂） ----------------
+	// ---------------- intervals（默认 60s，最低 minIntervalSec 防止把面板打挂） ----------------
 	if r.Intervals.UserPullSec <= 0 {
-		r.Intervals.UserPullSec = 60
+		r.Intervals.UserPullSec = defaultIntervalSec
 	}
 	if r.Intervals.TrafficPushSec <= 0 {
-		r.Intervals.TrafficPushSec = 60
+		r.Intervals.TrafficPushSec = defaultIntervalSec
 	}
 	if r.Intervals.AlivePushSec <= 0 {
-		r.Intervals.AlivePushSec = 60
+		r.Intervals.AlivePushSec = defaultIntervalSec
 	}
 	if r.Intervals.StatusPushSec <= 0 {
-		r.Intervals.StatusPushSec = 60
+		r.Intervals.StatusPushSec = defaultIntervalSec
 	}
 	for name, v := range map[string]int{
 		"user_pull_sec":    r.Intervals.UserPullSec,
@@ -347,13 +499,30 @@ func (r *Root) Validate() error {
 		"alive_push_sec":   r.Intervals.AlivePushSec,
 		"status_push_sec":  r.Intervals.StatusPushSec,
 	} {
-		if v < 5 {
-			return fmt.Errorf("intervals.%s 不可低于 5 秒（避免对上游 API 形成压测）", name)
+		if v < minIntervalSec {
+			return fmt.Errorf("intervals.%s 不可低于 %d 秒（避免对上游 API 形成压测）", name, minIntervalSec)
 		}
 	}
 
 	// ---------------- reporting ----------------
-	// AliveEnabled / StatusEnabled 都是 bool，YAML 解析的零值即"关闭"，无需补默认。
+	// AliveEnabled / StatusEnabled 都是 bool，零值即"关闭"，无需补默认。
+
+	// ---------------- web ----------------
+	r.Web.ListenAddr = strings.TrimSpace(r.Web.ListenAddr)
+	if r.Web.ListenAddr == "" {
+		r.Web.ListenAddr = defaultWebListenAddr
+	}
+	if r.Web.SessionMaxAgeHours <= 0 {
+		r.Web.SessionMaxAgeHours = defaultWebSessionMaxHours
+	}
+	if r.Web.AbsoluteMaxLifetimeHours <= 0 {
+		r.Web.AbsoluteMaxLifetimeHours = defaultWebAbsoluteMaxHours
+	}
+	if r.Web.SessionMaxAgeHours > r.Web.AbsoluteMaxLifetimeHours {
+		// 滑动窗口超过绝对寿命没意义——后者无效。运维明显误配，应当 fail-fast。
+		return fmt.Errorf("web.session_max_age_hours (%d) 不可超过 absolute_max_lifetime_hours (%d)",
+			r.Web.SessionMaxAgeHours, r.Web.AbsoluteMaxLifetimeHours)
+	}
 
 	return nil
 }
@@ -409,9 +578,55 @@ func sortedKeys(m map[string]struct{}) []string {
 	return out
 }
 
+// parseSettingInt 从 settings map 取 key 对应字符串并转 int。
+//
+// 缺失或解析失败一律返回 fallback——v0.2 的"半填友好"原则：从持久层
+// 读到的脏数据不应导致进程崩溃，而是退化到默认值并由 Web 表单层在用户
+// 下次写入时立即提示。
+func parseSettingInt(m map[string]string, key string, fallback int) int {
+	raw, ok := m[key]
+	if !ok {
+		return fallback
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return n
+}
+
+// parseSettingBool 从 settings map 取 key 对应字符串并转 bool。语义同
+// parseSettingInt。
+//
+// strconv.ParseBool 能处理 "1"/"0"/"true"/"false"/"True" 等十种常见写法，
+// 不需要在这里做大小写归一。
+func parseSettingBool(m map[string]string, key string, fallback bool) bool {
+	raw, ok := m[key]
+	if !ok {
+		return fallback
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fallback
+	}
+	b, err := strconv.ParseBool(raw)
+	if err != nil {
+		return fallback
+	}
+	return b
+}
+
 // Duration 是一组从配置秒数派生的便捷方法，避免下游业务代码每次都写 *time.Second。
-// 不在 Validate 中预先转换为 time.Duration 字段：因为 yaml 序列化 time.Duration
-// 体验差（"60s" vs 60000000000 各有歧义），直接保留 int 秒数最稳。
+//
+// 不在 Validate 中预先转换为 time.Duration 字段：因为 settings 表存的是
+// 字符串（详见 schema.go 的 settings 表注释），最自然的反序列化目标是
+// "纯整数秒"——既能被 strconv.Atoi 一行解析，也方便运维直接用
+// `sqlite3 ./data/bridge.db` 命令行手工核对当前生效值。预先转 Duration
+// 反而把"600000000000ns 还是 60s"的歧义引入 settings 字符串。
 
 // UserPullDuration 返回用户拉取循环的间隔。
 func (i Intervals) UserPullDuration() time.Duration { return secs(i.UserPullSec) }

@@ -1,19 +1,27 @@
-# 编译产物
-dist/
+# Go 编译产物（仅仓库根的 dist/——make build 输出处；不会误伤
+# internal/web/dist/ 这个 go:embed 真相源）
+/dist/
 *.exe
 *.test
 *.out
 
-# 本地状态库与日志
+# 本地状态库与日志（运行期产物，不入库）
 *.db
 *.db-shm
 *.db-wal
 *.log
 *.log.*
+data/
 
-# 配置（敏感信息）：仅提交 example，本地配置不入库
-config.yaml
-config.local.yaml
+# 首次密码文件（仅本地有效，绝不入仓）
+initial_password.txt
+
+# Node / Vite（前端构建产物 web/dist 不入库——由 Makefile 同步到 internal/web/dist）
+# 注意路径前缀 / —— 仅匹配仓库根的 web/，不会误伤 internal/web/（go:embed 入仓真相源）。
+/web/node_modules/
+/web/dist/
+/web/.vite/
+/web/.cache/
 
 # IDE / 编辑器
 .idea/

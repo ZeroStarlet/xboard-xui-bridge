@@ -1,0 +1,32 @@
+# Git 行尾规则。
+#
+# 主要目的：保证 install.sh 在 Linux/macOS 上 checkout 后是 LF——否则 bash
+# 会因 Windows CRLF 导致 `\r` 报错（`/usr/bin/env: 'bash\r': No such file`）。
+# 同时让 Go / Markdown / YAML / Dockerfile 等也强制 LF，避免开发者
+# autocrlf 配置差异污染历史。
+
+* text=auto eol=lf
+
+*.sh        text eol=lf
+*.go        text eol=lf
+*.md        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.json      text eol=lf
+*.ts        text eol=lf
+*.vue       text eol=lf
+*.css       text eol=lf
+*.html      text eol=lf
+*.mod       text eol=lf
+*.sum       text eol=lf
+Dockerfile  text eol=lf
+Makefile    text eol=lf
+
+# 二进制：不做任何转换。
+*.png       binary
+*.jpg       binary
+*.gif       binary
+*.ico       binary
+*.zip       binary
+*.tar.gz    binary
+*.tgz       binary

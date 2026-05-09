@@ -1,0 +1,10 @@
+# Node 依赖与构建产物。
+# dist/ 是开发者本地构建后的临时目录；M8 的 Makefile 会把它复制到
+# ../internal/web/dist/ 让 Go 的 go:embed 入仓。所以本目录的 dist
+# 不入版本管理，避免与入仓副本不一致。
+node_modules
+dist
+.cache
+*.local
+.DS_Store
+.vite
