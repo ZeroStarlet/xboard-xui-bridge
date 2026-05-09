@@ -1,6 +1,8 @@
 # Go 编译产物（仅仓库根的 dist/——make build 输出处；不会误伤
 # internal/web/dist/ 这个 go:embed 真相源）
 /dist/
+# 多平台交叉编译临时输出目录（脚本式产 release 包时用）
+/out/
 *.exe
 *.test
 *.out
