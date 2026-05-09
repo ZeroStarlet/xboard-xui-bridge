@@ -1,0 +1,25 @@
+# 编译产物
+dist/
+*.exe
+*.test
+*.out
+
+# 本地状态库与日志
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.log.*
+
+# 配置（敏感信息）：仅提交 example，本地配置不入库
+config.yaml
+config.local.yaml
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
