@@ -2,6 +2,16 @@
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * 全局样式（v0.5 视觉重构）。
+ *
+ * 设计令牌：把"颜色 / 圆角 / 阴影 / 间距"通过 Tailwind 主题（tailwind.config.js）
+ * 集中管理；本文件只负责"语义化 utility"——比如 .card / .input / .btn-primary 等
+ * 跨页面复用的小积木。这样新增页面时只需用积木拼装，不必每个组件重复贴长串
+ * 原子 class——既符合 Tailwind 哲学（utility-first），又给项目留下明确的设计
+ * 一致性边界。
+ */
+
 /* 全局基线 */
 html, body, #app {
   height: 100%;
@@ -9,31 +19,286 @@ html, body, #app {
 }
 
 body {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  /* 抗锯齿 + 字号优化：让中文 + 西文混排在所有平台都更精致。 */
+  font-family: 'Inter', 'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI',
+    'PingFang SC', 'Microsoft YaHei', 'Roboto', sans-serif;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: 'cv11', 'ss01';
+  /* 默认背景：极浅的青灰，比纯白更柔和；避免长时间凝视疲劳。 */
+  background-color: theme('colors.surface.50');
+  color: theme('colors.surface.800');
 }
 
-/* 自定义工具类：表单 input 默认形态 */
+/* 自定义滚动条——细且有品质感，与"上档次"目标一致。 */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background-color: theme('colors.surface.300');
+  border-radius: 9999px;
+  border: 2px solid theme('colors.surface.50');
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: theme('colors.surface.400');
+}
+
+/* 焦点可见性——为键盘用户保留清晰焦点环，但用品牌色而非默认蓝色。 */
+*:focus-visible {
+  outline: 2px solid theme('colors.brand.500');
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+/* 已经有 ring 的元素（input / button）让 *:focus-visible 不再叠加描边。 */
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+button:focus-visible {
+  outline: none;
+}
+
 @layer components {
-  .input {
-    @apply w-full rounded border border-gray-300 px-3 py-2 text-sm focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand;
-  }
-  .btn {
-    @apply rounded px-4 py-2 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-50;
-  }
-  .btn-primary {
-    @apply btn bg-brand text-white hover:bg-emerald-600;
-  }
-  .btn-secondary {
-    @apply btn bg-gray-200 text-gray-800 hover:bg-gray-300;
-  }
-  .btn-danger {
-    @apply btn bg-red-500 text-white hover:bg-red-600;
-  }
+  /* ============================================================
+   * 卡片系统——三层语义：
+   *   .card        默认承载（白底 + 柔阴影 + 圆角 xl）
+   *   .card-flat   嵌套区（无阴影 + 浅灰底，仅边框区分）
+   *   .card-glass  玻璃拟态（登录页 / 强调浮层）
+   * ============================================================ */
   .card {
-    @apply rounded-lg border border-gray-200 bg-white p-6 shadow-sm;
+    @apply rounded-2xl border border-surface-200/80 bg-white p-6 shadow-soft transition-shadow;
+  }
+  .card:hover {
+    /* 微妙 hover：阴影加深一档让交互可感，避免"一动不动"的死板。 */
+    box-shadow: 0 4px 16px -4px rgba(15, 23, 42, 0.10), 0 1px 4px 0 rgba(15, 23, 42, 0.05);
+  }
+  .card-flat {
+    @apply rounded-xl border border-surface-200 bg-surface-50 p-5;
+  }
+  .card-glass {
+    /* 玻璃拟态：半透明 + 模糊背景 + 内描边发光。仅在登录页等特殊场景用。 */
+    @apply rounded-3xl border border-white/40 p-8;
+    background-color: rgba(255, 255, 255, 0.70);
+    backdrop-filter: blur(20px) saturate(160%);
+    -webkit-backdrop-filter: blur(20px) saturate(160%);
+    box-shadow:
+      0 24px 48px -12px rgba(15, 23, 42, 0.22),
+      0 0 0 1px rgba(255, 255, 255, 0.40) inset;
+  }
+
+  /* ============================================================
+   * 输入控件
+   * ============================================================ */
+  .input {
+    @apply w-full rounded-xl border border-surface-200 bg-white px-3.5 py-2.5 text-sm text-surface-800
+           placeholder:text-surface-400 transition-all duration-150
+           hover:border-surface-300
+           focus:border-brand-500 focus:outline-none focus:shadow-glow;
+  }
+  .input:disabled {
+    @apply cursor-not-allowed bg-surface-100 text-surface-500;
+  }
+  .input-mono {
+    @apply font-mono text-[13px];
   }
   .label {
-    @apply mb-1 block text-sm font-medium text-gray-700;
+    @apply mb-1.5 block text-[13px] font-medium text-surface-700;
+  }
+  .help-text {
+    @apply mt-1.5 text-xs text-surface-500;
+  }
+
+  /* ============================================================
+   * 按钮系统——主 / 次 / 危险 / 幽灵 四种语义。
+   * 所有按钮共享 .btn 基础类（尺寸 + 过渡）；颜色由变体类提供。
+   *
+   * 设计选择：渐变色让主按钮更"上档次"；hover 时阴影加深 + 微 scale，
+   * 给运维"按下去能感受到反馈"的物理层面满足感。
+   * ============================================================ */
+  .btn {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-xl px-4 py-2 text-sm font-medium
+           transition-all duration-150 ease-out
+           disabled:cursor-not-allowed disabled:opacity-50
+           focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2;
+  }
+  .btn-primary {
+    @apply btn text-white focus-visible:ring-brand-500;
+    background-image: linear-gradient(135deg, theme('colors.brand.500'), theme('colors.brand.600'));
+    box-shadow: 0 1px 2px 0 rgba(15, 23, 42, 0.05);
+  }
+  .btn-primary:hover:not(:disabled) {
+    background-image: linear-gradient(135deg, theme('colors.brand.600'), theme('colors.brand.700'));
+    box-shadow: 0 4px 12px -2px rgba(16, 185, 129, 0.40);
+    transform: translateY(-1px);
+  }
+  .btn-primary:active:not(:disabled) {
+    transform: translateY(0);
+    box-shadow: 0 1px 2px 0 rgba(15, 23, 42, 0.05);
+  }
+  .btn-secondary {
+    @apply btn border border-surface-200 bg-white text-surface-700
+           hover:border-surface-300 hover:bg-surface-50 hover:text-surface-900
+           focus-visible:ring-surface-400;
+  }
+  .btn-danger {
+    @apply btn text-white focus-visible:ring-rose-500;
+    background-image: linear-gradient(135deg, theme('colors.rose.500'), theme('colors.rose.600'));
+  }
+  .btn-danger:hover:not(:disabled) {
+    background-image: linear-gradient(135deg, theme('colors.rose.600'), theme('colors.rose.700'));
+    box-shadow: 0 4px 12px -2px rgba(244, 63, 94, 0.40);
+    transform: translateY(-1px);
+  }
+  .btn-ghost {
+    /* 幽灵按钮——卡片内 / 工具栏内的轻量按钮，悬停才出现填充。 */
+    @apply btn bg-transparent text-surface-600 hover:bg-surface-100 hover:text-surface-900;
+  }
+  .btn-sm {
+    @apply px-3 py-1.5 text-[13px];
+  }
+  .btn-icon {
+    /* 纯图标按钮——正方形、无内边距文本、悬停高亮。 */
+    @apply inline-flex h-9 w-9 items-center justify-center rounded-lg text-surface-500
+           transition-colors duration-150
+           hover:bg-surface-100 hover:text-surface-800
+           focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500;
+  }
+
+  /* ============================================================
+   * 复选框——.cb 是项目统一的"原生 checkbox 着色"约定。
+   *
+   * 设计动机：原生 input[type=checkbox] 的勾选色在大多数浏览器都是系统蓝色；
+   * 想让它跟品牌色（brand 绿）一致，最简单的方式是 CSS accent-color 属性
+   * （Chrome 93+ / Firefox 92+ / Safari 15.4+，2021 年后全平台支持）。
+   * Tailwind 通过 accent-* 工具类映射到该属性。
+   *
+   * 不引入第三方 forms 插件（如 @tailwindcss/forms）的原因：插件会接管所有
+   * input/select 的默认样式，本项目自定义 .input 已经一致，没必要再叠加。
+   * ============================================================ */
+  .cb {
+    @apply h-4 w-4 rounded border-surface-300 accent-brand-500
+           transition-colors duration-150
+           focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2;
+  }
+
+  /* ============================================================
+   * 状态徽章（pill）——用于"启用 / 禁用 / 运行中 / 已停止"等小状态标签。
+   * 每个变体都是 dot + 文本的组合，dot 提供色彩瞬时识别。
+   * ============================================================ */
+  .pill {
+    @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium;
+  }
+  .pill-dot {
+    @apply h-1.5 w-1.5 rounded-full;
+  }
+  .pill-success {
+    @apply pill bg-brand-50 text-brand-700 ring-1 ring-inset ring-brand-200;
+  }
+  .pill-success .pill-dot { @apply bg-brand-500; }
+  .pill-warning {
+    @apply pill bg-amber-50 text-amber-700 ring-1 ring-inset ring-amber-200;
+  }
+  .pill-warning .pill-dot { @apply bg-amber-500; }
+  .pill-danger {
+    @apply pill bg-rose-50 text-rose-700 ring-1 ring-inset ring-rose-200;
+  }
+  .pill-danger .pill-dot { @apply bg-rose-500; }
+  .pill-neutral {
+    @apply pill bg-surface-100 text-surface-600 ring-1 ring-inset ring-surface-200;
+  }
+  .pill-neutral .pill-dot { @apply bg-surface-400; }
+  .pill-info {
+    @apply pill bg-accent-50 text-accent-700 ring-1 ring-inset ring-accent-200;
+  }
+  .pill-info .pill-dot { @apply bg-accent-500; }
+
+  /* ============================================================
+   * 警示横幅（提示性消息条）——alert
+   * 与 pill 区分：横幅承载较多文字，pill 仅是 1 词标签。
+   * ============================================================ */
+  .alert {
+    @apply flex items-start gap-3 rounded-xl border p-4 text-sm;
+  }
+  .alert-error   { @apply alert border-rose-200 bg-rose-50 text-rose-800; }
+  .alert-success { @apply alert border-brand-200 bg-brand-50 text-brand-800; }
+  .alert-warning { @apply alert border-amber-200 bg-amber-50 text-amber-800; }
+  .alert-info    { @apply alert border-accent-200 bg-accent-50 text-accent-800; }
+
+  /* ============================================================
+   * 表格语义类——data-table。
+   * 行悬停 + 等高 + 圆角剪裁 + 表头分割线。
+   * ============================================================ */
+  .data-table {
+    @apply w-full text-sm;
+  }
+  .data-table thead th {
+    @apply text-left text-[12px] font-semibold uppercase tracking-wider text-surface-500
+           py-3 px-4 border-b border-surface-200;
+  }
+  .data-table tbody td {
+    @apply py-3 px-4 text-surface-700 border-b border-surface-100;
+  }
+  .data-table tbody tr:last-child td {
+    @apply border-b-0;
+  }
+  .data-table tbody tr {
+    @apply transition-colors duration-100;
+  }
+  .data-table tbody tr:hover {
+    @apply bg-surface-50;
+  }
+
+  /* ============================================================
+   * Section 标题——分组卡片头部用。两段式 (icon + text + subtitle)。
+   * ============================================================ */
+  .section-title {
+    @apply mb-4 flex items-center gap-3;
+  }
+  .section-title-icon {
+    /* 单色图标徽章：圆形背景 + 内嵌图标。 */
+    @apply flex h-9 w-9 items-center justify-center rounded-xl bg-brand-50 text-brand-600;
+  }
+  .section-title-text {
+    @apply text-base font-semibold text-surface-800;
+  }
+  .section-title-subtitle {
+    @apply text-xs text-surface-500;
+  }
+
+  /* ============================================================
+   * KPI 卡片（仪表盘指标卡）——title + value + 状态徽标三段式。
+   * ============================================================ */
+  .kpi-card {
+    @apply card flex flex-col gap-2 overflow-hidden;
+  }
+  .kpi-label {
+    @apply text-xs font-medium uppercase tracking-wider text-surface-500;
+  }
+  .kpi-value {
+    @apply text-3xl font-semibold tracking-tight text-surface-900;
+  }
+}
+
+@layer utilities {
+  /* 隐藏元素但保留 ARIA 可访问性。 */
+  .sr-only-soft {
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    height: 1px;
+    overflow: hidden;
+    position: absolute;
+    white-space: nowrap;
+    width: 1px;
+  }
+  /* 渐变文字——主标题 / Logo 用。 */
+  .text-gradient-brand {
+    background-image: linear-gradient(135deg, theme('colors.brand.500'), theme('colors.accent.500'));
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: transparent;
   }
 }

@@ -15,8 +15,14 @@ import (
 //
 //	a) 优先从 3x-ui /panel/api/server/status 拿——它跑在节点真机上，CPU/内存数据准确。
 //	b) 拉取或解析失败时退化为"中间件自身的 runtime stats"（仅 CPU 占用近似 0%、
-//	   mem 仅含 Go runtime 用量）。这种降级模式仅作为"心跳保活"语义，让 Xboard
-//	   认为节点仍活着，不至于因一次 status 失败把节点标黄。
+//	   mem 仅含 Go runtime 用量）。这种降级模式让 Xboard 后台运维仍能看到节点
+//	   有上报（SERVER_*_LAST_LOAD_AT 缓存被刷新 + 负载数据非空），不至于因一次
+//	   status 失败把节点负载条标灰。
+//
+// **重要澄清（v0.5 修正）**：本上报仅刷新 SERVER_*_LAST_LOAD_AT 缓存，与节点
+// "在线 / 异常"判定（SERVER_*_LAST_PUSH_AT，由 traffic_sync 维护）**完全无关**。
+// v0.4 之前老注释一度写"心跳保活靠 status_sync"——那是错的。真正的节点活跃心跳
+// 在 traffic_sync 中通过 [0, 0] 占位 push 维持，详见 traffic_sync.go 文件头注释。
 //
 // 为何没有 swap / disk 真实值：
 //
@@ -45,6 +51,11 @@ func (w *bridgeWorker) syncStatus(ctx context.Context) error {
 }
 
 // pushHeartbeat 在拉不到节点真实状态时，构造一份"中间件自身可观测"的最小状态上报。
+//
+// **命名澄清（v0.5）**：函数名中的 "heartbeat" 仅指 status 子循环的"降级上报"
+// 语义——保证 Xboard 后台运维看到节点负载条非空——与节点"在线 / 异常"判定无关。
+// 节点 STATUS_ONLINE / STATUS_ONLINE_NO_PUSH 切换由 traffic_sync 维护
+// （详见 traffic_sync.go 文件头注释）；本函数与该判定完全解耦。
 //
 // 关键约束：所有字段必须非负，cpu ∈ [0, 100]——Xboard 校验失败会返回 422，
 // 比"完全不报"更糟糕。这里宁可上报 0 也不省略字段。

@@ -88,9 +88,13 @@ func (c *Client) FetchUsers(ctx context.Context, nodeID int, nodeType string) (*
 // 行为约定：
 //
 //   - 即使 traffic 为空也会被序列化为 {} 提交；但 Xboard 端 processTraffic 在
-//     empty 时直接 return 不更新任何缓存，所以本调用不能被当作"心跳保活"——
-//     调用方应当自己判断 len(traffic) > 0 后再调用，避免无效请求。
-//     节点心跳保活靠 status_sync 的 /status 上报刷新 SERVER_*_LAST_LOAD_AT。
+//     array_filter 后 empty($data) 时直接 return **不更新任何缓存**，等价于
+//     "请求白发"。所以发空 traffic 既无业务效果也不维持 LAST_PUSH_AT。
+//   - 节点 STATUS_ONLINE / STATUS_ONLINE_NO_PUSH 切换由 traffic_sync 通过
+//     "[0, 0] 占位项 push" 心跳维持（详见 internal/sync/traffic_sync.go
+//     文件头注释）；status_sync 的 /status 端点只刷新 LAST_LOAD_AT 缓存，
+//     与节点 available_status 判定无关——v0.4 之前老注释一度写"心跳保活
+//     靠 status_sync"，那是错的，已在 v0.5 修正。
 //   - 成功语义：HTTP 200 且 body 反序列化得到 {data:true}（Xboard 约定）；
 //     任一不满足都返回 *Error，调用方据此决定是否回退基线。
 func (c *Client) PushTraffic(ctx context.Context, nodeID int, nodeType string, traffic PushTraffic) error {
