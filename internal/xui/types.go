@@ -5,15 +5,12 @@
 //  1. 所有响应包装在 {success:bool, msg:string, obj:any}；success=false 即业务错误。
 //  2. inbound 的 settings / streamSettings / sniffing 是嵌入对象的 JSON 字符串
 //     （二次 JSON），增删 client 时必须解码 → 改 → 重新编码。
-//  3. 鉴权 v0.3 起支持双模式：
-//     - token 模式  → 注入 Authorization: Bearer <api_token>，无状态请求；
-//                   适用于主线 3x-ui v2.4+ 已生成 API Token 的部署。
-//     - cookie 模式 → POST /login 拿 session cookie，由 cookiejar 自动维护；
-//                   遇到 401 / 302 / HTML 登录页 / success=false 含登录关键字
-//                   等失效信号自动重登录并重试一次。适用于 fork 版本不支持
-//                   Bearer Token（如某些 2.9.x fork：strings | grep -ic apitoken
-//                   == 0）或主线但管理员未启用 API Token 的场景。
-//     详见 client.go Client 结构体头部注释与 config.XuiAuthMode* 常量。
+//  3. 鉴权 v0.4 起统一为 cookie 登录模式：POST /login 拿 session cookie，
+//     由 cookiejar 自动维护；遇到 401 / 302 / HTML 登录页 / success=false
+//     含登录关键字等失效信号自动重登录并重试一次。Bearer Token 模式
+//     （v0.2/v0.3）已彻底移除——主线与 fork 在浏览器后台都同等支持
+//     /login 表单，统一为唯一鉴权方式让代码体积、Web 表单分支、运维心智
+//     三方面都简化。详见 client.go Client 结构体头部注释。
 //  4. 路径前缀含可配置的 webBasePath，所有 API 实际路径为
 //     {host}{basePath}/panel/api/...，本包会自动拼接。
 package xui
@@ -23,19 +20,17 @@ import (
 	"errors"
 )
 
-// 公开 sentinel 错误（仅 cookie 鉴权模式产生）。
+// 公开 sentinel 错误（cookie 登录失败时产生）。
 //
 // 调用方使用 errors.Is 区分，便于上层日志层把"用户名密码错"与"通用网络/业务
 // 错误"区别处理：
 //
 //	errors.Is(err, ErrInvalidCredentials)  → 不要重试；要求运维核对凭据
 //	errors.Is(err, ErrTOTPRequired)        → 要求运维补填 / 校正 TOTP secret
-//
-// token 模式下永远不会返回这两种错误（该模式不调用 /login）。
 var (
 	// ErrInvalidCredentials 表示 /login 调用 HTTP 200 但 commonResp.success=false，
 	// 且 msg 不含 2FA 关键字——多数情况下意味着用户名或密码错误。
-	ErrInvalidCredentials = errors.New("xui: 用户名或密码错误（cookie 模式登录失败）")
+	ErrInvalidCredentials = errors.New("xui: 用户名或密码错误（登录失败）")
 	// ErrTOTPRequired 表示 /login 调用返回 success=false 且 msg 含"two factor"
 	// "2fa""二次""二步""动态密码"等 2FA 相关关键字——意味着 3x-ui 已启用 2FA，
 	// 但中间件配置中 TOTP secret 未填或填错（含时钟漂移过大）。

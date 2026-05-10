@@ -21,15 +21,15 @@ import (
 
 // Client 是 3x-ui 面板 API 客户端。
 //
-// 鉴权（v0.3 起双模式，互斥）：
+// 鉴权（v0.4 起仅 cookie 登录模式）：
 //
-//	token 模式  → 注入 Authorization: Bearer <api_token>，无状态请求；
-//	            适用于主线 3x-ui v2.4+ 已生成 API Token 的部署。
-//	cookie 模式 → 首次调用时 POST /login 拿 session cookie 存进 cookiejar，
-//	            后续请求由 net/http 自动带 cookie。鉴权失效（401 / 302 /
-//	            HTML 登录页 / JSON success=false 含登录关键字）时自动
-//	            重登录并重试一次；适用于不支持 Bearer Token 的 fork（如
-//	            2.9.x）或主线但管理员禁用了 API Token 的部署。
+//	首次调用时 POST /login 拿 session cookie 存进 cookiejar，后续请求由
+//	net/http 自动带 cookie。鉴权失效（401 / 302 / HTML 登录页 / JSON
+//	success=false 含登录关键字）时自动重登录并重试一次；二次仍失败即返回
+//	*Error 让上层 sync 循环走 WARN 路径，下个周期再试。
+//
+//	若 3x-ui 后台启用了 TOTP 2FA，构造时传 cfg.TOTPSecret（base32），每次
+//	/login 自动算 RFC 6238 6 位码塞 twoFactorCode 字段；未启用 2FA 留空即可。
 //
 // 并发安全：
 //
@@ -39,15 +39,13 @@ import (
 //	   造成"5 个 worker 各自登录 5 次"的请求风暴。
 //	c) loggedIn 字段同样由 loginMu 保护——仅 ensureLoggedIn / invalidateSession
 //	   两处读写，访问点都已持锁。
-//	d) authMode / username / password / totpSecret / apiToken / baseURL 等
-//	   构造后不可变字段无锁；它们的读取行为对所有 goroutine 一致。
+//	d) baseURL / username / password / totpSecret 等构造后不可变字段无锁；
+//	   它们的读取行为对所有 goroutine 一致。
 type Client struct {
 	baseURL    string // host + base_path（不含尾 /）
-	authMode   string // config.XuiAuthModeToken 或 config.XuiAuthModeCookie
-	apiToken   string // 仅 token 模式使用
-	username   string // 仅 cookie 模式使用
-	password   string // 仅 cookie 模式使用
-	totpSecret string // 仅 cookie 模式 + 3x-ui 启用 2FA 时使用；空串表示未启用
+	username   string
+	password   string
+	totpSecret string // 3x-ui 启用 2FA 时使用；空串表示未启用
 	httpClient *http.Client
 
 	// loginMu 同时保护 loggedIn 与"是否正在 /login 中"。两处临界区不在同一
@@ -61,17 +59,12 @@ type Client struct {
 
 // New 构造 Client。
 //
-// 不发起任何网络请求（cookie 模式的 /login 推迟到首次业务调用时由 ensureLoggedIn
-// 触发，便于"半填配置"场景仍能完成 Client 构造，引擎后续 Reload 即可恢复）。
+// 不发起任何网络请求（/login 推迟到首次业务调用时由 ensureLoggedIn 触发），
+// 便于"半填配置"场景仍能完成 Client 构造，引擎后续 Reload 即可恢复。
 //
 // 构造失败仅可能源于 cookiejar.New 返回错误——当前 Go 标准库对 nil options
 // 一定返回 nil error，但仍保留错误传递路径以适配未来 std 库变更。TLS 配置
 // 错误会被 *http.Transport 推迟到首次请求时报告，本函数不主动检测。
-//
-// 字段填充策略：authMode / apiToken / username / password / totpSecret 全部
-// 按 cfg 复制（即使当前模式不读取另一组字段，也保留完整快照——便于将来在
-// 同一 Client 实例上动态切模式时不丢数据）。但运行期实际只读取与 authMode
-// 匹配的那一组。
 func New(cfg config.Xui) (*Client, error) {
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
@@ -83,27 +76,23 @@ func New(cfg config.Xui) (*Client, error) {
 		IdleConnTimeout:     90 * time.Second,
 	}
 
+	// 3x-ui 用 gin sessions 默认 cookie 名 "session" 且 HttpOnly + Path=/，
+	// 标准 cookiejar 自动处理域 / 路径作用域，无需特殊配置。
+	// 使用 nil options：默认 PublicSuffixList=nil 不做公共后缀过滤，对 IP 直连
+	// 与本地局域网域名都友好。
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, fmt.Errorf("初始化 cookie jar：%w", err)
+	}
+
 	httpClient := &http.Client{
 		Transport: transport,
 		Timeout:   time.Duration(cfg.TimeoutSec) * time.Second,
-	}
-
-	// cookie 模式下挂 jar——3x-ui 用 gin sessions 默认 cookie 名 "session"
-	// 且 HttpOnly + Path=/，标准 cookiejar 自动处理域 / 路径作用域，无需特殊配置。
-	// 使用 nil options：默认 PublicSuffixList=nil 不做公共后缀过滤，对 IP 直连
-	// 与本地局域网域名都友好。
-	if cfg.AuthMode == config.XuiAuthModeCookie {
-		jar, err := cookiejar.New(nil)
-		if err != nil {
-			return nil, fmt.Errorf("初始化 cookie jar：%w", err)
-		}
-		httpClient.Jar = jar
+		Jar:       jar,
 	}
 
 	c := &Client{
 		baseURL:    cfg.APIHost + cfg.BasePath,
-		authMode:   cfg.AuthMode,
-		apiToken:   cfg.APIToken,
 		username:   cfg.Username,
 		password:   cfg.Password,
 		totpSecret: cfg.TOTPSecret,
@@ -248,18 +237,18 @@ func (c *Client) GetServerStatus(ctx context.Context) (json.RawMessage, error) {
 
 // do 是所有面板 API 共享的传输层。
 //
-// v0.3 起的语义：
+// v0.4 起的语义（仅 cookie 模式）：
 //
-//	token 模式  → 直接 sendOnce 一次，注入 Authorization Bearer；401 / 403 等
-//	             鉴权错误以 *Error 抛出（运维需手动核对 token）。完全等同 v0.2。
-//	cookie 模式 → ensureLoggedIn → sendOnce 一次；若 sendOnce 报"鉴权失效"
-//	             （由 looksLikeAuthFailed 识别），则 invalidateSession +
-//	             ensureLoggedIn + sendOnce 第二次。第二次仍失败即返回 *Error，
-//	             不再无限重试（防请求风暴 / 防账户锁定）。
+//	1. ensureLoggedIn 确保 cookiejar 中有有效 session cookie；登录失败立刻
+//	   返回 *Error，不发出"必然 401"的无效业务请求；
+//	2. sendOnce 发一次请求；若返回 authStale=true（looksLikeAuthFailed 识别）
+//	   则 invalidateSession + ensureLoggedIn + sendOnce 第二次；
+//	3. 第二次仍 stale → 立刻报错，绝不返回 (nil, nil) 让 mutating 端点
+//	   （AddClient / UpdateClient 等）误判"已写入"。
 //
 // body 重读保护：把序列化结果保留在 bodyBytes 中，sendOnce 内部用
-// bytes.NewReader 重新构造 io.Reader——确保 cookie 模式重试时 body 不会因为
-// 已被 http.Client.Do 消费而 EOF（io.Reader 不可重读 pitfall）。
+// bytes.NewReader 重新构造 io.Reader——确保重试时 body 不会因为已被
+// http.Client.Do 消费而 EOF（io.Reader 不可重读 pitfall）。
 func (c *Client) do(ctx context.Context, method, endpoint string, body any) (json.RawMessage, error) {
 	full := c.baseURL + endpoint
 
@@ -272,12 +261,8 @@ func (c *Client) do(ctx context.Context, method, endpoint string, body any) (jso
 		}
 	}
 
-	// cookie 模式：先确保已登录（首次或之前被 invalidate 过都走这条路径）。
-	// 登录失败直接终止；不发业务请求——避免发出"必然 401"的无效请求。
-	if c.authMode == config.XuiAuthModeCookie {
-		if err := c.ensureLoggedIn(ctx); err != nil {
-			return nil, fmt.Errorf("登录 3x-ui：%w", err)
-		}
+	if err := c.ensureLoggedIn(ctx); err != nil {
+		return nil, fmt.Errorf("登录 3x-ui：%w", err)
 	}
 
 	raw, authStale, err := c.sendOnce(ctx, method, full, endpoint, bodyBytes)
@@ -285,7 +270,6 @@ func (c *Client) do(ctx context.Context, method, endpoint string, body any) (jso
 		return raw, err
 	}
 
-	// authStale=true 必然是 cookie 模式（token 模式的 sendOnce 永远不会标 stale）。
 	// 重登录 + 重试一次。第二次仍 stale → 立刻报错，避免返回 (nil, nil) 让上层
 	// 误判"业务成功但 obj 为 null"——AddClient / UpdateClient / DelClientByEmail
 	// 等 mutating 端点拿到 err==nil 会直接进入"已写入"状态机，破坏一致性。
@@ -299,8 +283,7 @@ func (c *Client) do(ctx context.Context, method, endpoint string, body any) (jso
 		//   a) 运维在 3x-ui 后台改了密码但中间件 settings 未同步；
 		//   b) 3x-ui 启用了暴力破解保护，连续 /login 触发临时锁定；
 		//   c) 3x-ui 启用了 CSRF middleware（v2.4+ 主线 fork 行为可能不同），
-		//      cookie 登录后还需 X-CSRF-Token——本期 v0.3 暂不实现，遇到时
-		//      留给后续 mini-M 扩展（详见 docs/v0.3-roadmap.md §5.1）。
+		//      cookie 登录后还需 X-CSRF-Token——v0.4 暂不实现，遇到时再扩展。
 		// 这里返回明确 *Error 而不是 (nil, nil)，确保 mutating 调用（AddClient
 		// 等）不会把"未写入"误当作"已写入"。
 		return nil, &Error{
@@ -318,13 +301,16 @@ func (c *Client) do(ctx context.Context, method, endpoint string, body any) (jso
 //
 //	(obj, false, nil)  → 成功，obj 为 commonResp.obj 字段（可能为 null）；
 //	(nil, false, err)  → 普通错误（网络 / 4xx 非鉴权 / 5xx / success=false 业务错）；
-//	(nil, true, nil)   → 仅 cookie 模式：检测到鉴权失效，调用方应触发重登录 + 重试。
+//	(nil, true, nil)   → 检测到鉴权失效，调用方应触发重登录 + 重试。
 //
 // 不让"鉴权失效"作为 err 的特例，是为了让上层用 if authStale 判别比 errors.Is
 // 更直观；err 永远表达"无法继续"语义，调用方拿到 err 直接返回即可。
 //
 // 入参 endpoint 仅用于 *Error 的诊断标签——与 fullURL 解耦，便于日志中既能
 // 看到完整 URL 又能保留语义化的端点路径。
+//
+// 鉴权策略：cookie 由 httpClient.Jar 自动注入；本函数不手动 Set("Cookie", ...)
+// 是为了让 jar 的"路径作用域 / 过期处理"语义完整生效。
 func (c *Client) sendOnce(ctx context.Context, method, fullURL, endpoint string, bodyBytes []byte) (json.RawMessage, bool, error) {
 	var bodyReader io.Reader
 	if bodyBytes != nil {
@@ -339,13 +325,6 @@ func (c *Client) sendOnce(ctx context.Context, method, fullURL, endpoint string,
 	}
 	req.Header.Set("Accept", "application/json")
 
-	// 鉴权头注入：仅 token 模式需要。cookie 模式由 httpClient.Jar 自动带 cookie，
-	// 这里不手动 Set("Cookie", ...) 是为了让 jar 的"路径作用域 / 过期处理"语义
-	// 完整生效。
-	if c.authMode == config.XuiAuthModeToken {
-		req.Header.Set("Authorization", "Bearer "+c.apiToken)
-	}
-
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, false, &Error{HTTPStatus: 0, Endpoint: endpoint, Msg: err.Error()}
@@ -354,8 +333,8 @@ func (c *Client) sendOnce(ctx context.Context, method, fullURL, endpoint string,
 
 	rawBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024)) // 4MB 兜底，避免巨型响应耗内存
 
-	// cookie 模式下识别"鉴权失效"。token 模式下永远 false——401 直接当业务错抛。
-	if c.authMode == config.XuiAuthModeCookie && c.looksLikeAuthFailed(resp, rawBody) {
+	// 识别"鉴权失效"——上层 do() 收到 authStale=true 会触发重登录 + 重试一次。
+	if c.looksLikeAuthFailed(resp, rawBody) {
 		return nil, true, nil
 	}
 

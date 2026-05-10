@@ -122,13 +122,12 @@ export interface Bridge {
 export interface Settings {
   log: { level: string; file: string; max_size_mb: number; max_backups: number; max_age_days: number }
   xboard: { api_host: string; token: string; timeout_sec: number; skip_tls_verify: boolean; user_agent: string }
-  // xui v0.3 起新增 username / password / totp_secret 三字段（仅 auth_mode='cookie' 时使用）；
-  // 切换 auth_mode 时另一组字段保留在表单中但被后端忽略——确保运维误切回原模式时不丢凭据。
+  // xui v0.4 起仅 cookie 登录模式：username + password（+ 可选 totp_secret）。
+  // Bearer Token 模式（v0.2/v0.3 的 api_token / auth_mode 字段）已彻底移除——
+  // 旧 settings 表里残留行被后端 LoadFromStore 忽略，前端类型也不再暴露。
   xui: {
     api_host: string
     base_path: string
-    auth_mode: string
-    api_token: string
     username: string
     password: string
     totp_secret: string

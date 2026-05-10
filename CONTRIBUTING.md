@@ -39,22 +39,27 @@
 
   5. `web/src/api/client.ts` 的 `Settings` interface 加新字段；`SettingsPatch` 是 mapped type 自动跟随，无需显式改；
   6. `web/src/views/Settings.vue` 的 `form.<group>` 初值 + 模板表单 `v-model` 同步；
-  7. 新增"密码"或"TOTP secret"类敏感字段时，模板用 `<input type="password">`；并按 `auth_mode` 等条件字段动态显隐另一组互斥字段，避免运维误填闲置字段引发歧义。**例外**：`xui.api_token` 自 v0.2 起保持 plain input UX（不加 type=password），改动会破坏既有运维体验——新增字段不要参照该既有写法，按本条规范走。
+  7. 新增"密码"或"TOTP secret"类敏感字段时，模板用 `<input type="password">`；如新增字段间存在互斥关系（同一时刻只填一组），用 `v-if` 按上下文条件字段动态显隐避免运维误填——v0.4 已收敛 xui 鉴权为单一 cookie 模式，目前没有该类互斥字段，规则保留以备未来。
 
 > **数据库不再有 yaml 解析的 `KnownFields(true)` 护栏**——SQLite 写入时不会拒绝拼错的 key，所以 `Setting*` 常量是唯一真相源；任何手写字符串都属于风格违规，PR 审查中必须用常量替换。
 
 历史背景：v0.1 通过 `gopkg.in/yaml.v3` 的 `KnownFields(true)` 阻止配置拼写错误；v0.2 改用 SQLite KV 后，这层护栏由"Web 表单写入路径只接受 `Setting*` 常量列出的 key"承担——具体实现详见 `internal/web/settings_handler.go` 的白名单逻辑。
 
-### 4.1 鉴权模式选择（v0.3 起）
+### 4.1 3x-ui 鉴权（v0.4 起仅 cookie 登录模式）
 
-`xui.auth_mode` 是 v0.3 引入的双模式开关，决定 `internal/xui/client.go` 走哪条鉴权路径。开发新功能或修 bug 涉及该路径时，按下表判断影响面：
+中间件统一通过 `POST /login` + session cookie 调用 3x-ui panel API，相关字段：
 
-| auth_mode | 何时用 | 涉及配置字段 | 何时不能用 |
-| --- | --- | --- | --- |
-| `token`（默认） | 主线 3x-ui v2.4+，已生成 API Token | `xui.api_token`（48 字符） | fork 不实现 apiToken 中间件（`strings $(which x-ui) \| grep -ic apitoken == 0`）的部署 |
-| `cookie` | fork 不支持 Bearer / 主线但管理员未启用 API Token | `xui.username` + `xui.password`（+ 可选 `xui.totp_secret`） | 3x-ui 对 `/panel/api/*` 强制 X-CSRF-Token 校验的 CSRF middleware（当前未实现兼容；遇到再扩展） |
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `xui.api_host` | 是 | 3x-ui 面板根 URL（含协议头） |
+| `xui.base_path` | 否 | 3x-ui 的 webBasePath；空表示 `/` |
+| `xui.username` | 是* | 3x-ui 后台登录用户名 |
+| `xui.password` | 是* | 3x-ui 后台登录密码 |
+| `xui.totp_secret` | 否 | 仅 3x-ui 启用 TOTP 2FA 时填（base32） |
 
-切换鉴权模式**不需要 db schema 迁移**——cookie 不持久化，进程重启后 `ensureLoggedIn` 自动重发 `/login`。`*config.Root.Xui` 同时容纳两组字段（token 模式忽略 `Username/Password/TOTPSecret`；cookie 模式忽略 `APIToken`），运维切回原模式时凭据不丢失。详见 `internal/xui/client.go` 头部注释 + `config.XuiAuthMode*` 常量注释。
+`*` username / password 必须**同时填写或同时留空**（半填触发 Validate 报错；全空 = 首次启动空载等待 Web 面板填配置）。
+
+**v0.2/v0.3 的 Bearer Token 模式已彻底移除**——`xui.auth_mode` / `xui.api_token` 两个 settings key 已废弃；旧 settings 表里残留行被 `LoadFromStore` 忽略，无害保留。从 v0.2/v0.3 升级的运维必须重新填账号密码。详见 `internal/xui/client.go` 头部注释。
 
 ## 5. 前端变更（v0.2 起的 SPA 流程）
 

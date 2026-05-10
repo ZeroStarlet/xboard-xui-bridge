@@ -310,9 +310,10 @@ func (s *Supervisor) startEngineLocked(eng *syncengine.Engine) {
 
 // applyCredsGuard 检查 Xboard / 3x-ui 凭据完整性，必要时清空 cfg.Bridges。
 //
-// 行为：当 enabled bridge 存在但 xboard.api_host / xboard.token /
-// xui.api_host / xui.api_token 任一为空时，强制把 cfg.Bridges 置为 nil，
-// 让引擎装配 0 worker，避免每周期产生大量"无效"或"未鉴权"请求。
+// 行为：当 enabled bridge 存在但凭据未配齐（xboard.api_host / xboard.token
+// 任一为空，或 xui.api_host / xui.username / xui.password 任一为空）时，
+// 强制把 cfg.Bridges 置为 nil，让引擎装配 0 worker，避免每周期产生大量
+// "无效" 或 "未鉴权" 请求。
 //
 // 返回值：true 表示触发了清空；false 表示无需介入。便于调用方在日志里
 // 区分"按用户配置正常运行"与"被护栏降级到空载"。
@@ -326,8 +327,12 @@ func (s *Supervisor) startEngineLocked(eng *syncengine.Engine) {
 // 用法是：cfg 来自 LoadFromStore（独立 *Root 实例），原地修改不会污染
 // 持久层，调用方下次 LoadFromStore 仍能拿到 store 里的真实 bridges。
 func applyCredsGuard(cfg *config.Root, log *slog.Logger) bool {
-	xboardOK := cfg.Xboard.APIHost != "" && cfg.Xboard.Token != ""
-	xuiOK := cfg.Xui.APIHost != "" && cfg.Xui.APIToken != ""
+	// 委托给 cfg.{Xboard,Xui}.CredsComplete()——同一份函数在
+	// internal/web/status_handler.go 也使用，杜绝运维看到的"凭据完整性"灯
+	// 与引擎实际行为不一致。v0.4 起 xui 仅 cookie 登录模式，CredsComplete
+	// 检查 APIHost + Username + Password 三必填。
+	xboardOK := cfg.Xboard.CredsComplete()
+	xuiOK := cfg.Xui.CredsComplete()
 	if xboardOK && xuiOK {
 		return false
 	}

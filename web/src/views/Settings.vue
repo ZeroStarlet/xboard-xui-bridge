@@ -15,15 +15,10 @@ const original = ref<Settings | null>(null)
 const form = reactive({
   log: { level: 'info', file: '', max_size_mb: 0, max_backups: 0, max_age_days: 0 },
   xboard: { api_host: '', token: '', timeout_sec: 15, skip_tls_verify: false, user_agent: '' },
-  // xui form：v0.3 起含 username / password / totp_secret，按 auth_mode 切换显示。
-  // 注意 default auth_mode 仍是 'token'——既保持 v0.2 用户体验不变，又避免新部署
-  // 默认走 cookie 触发后端"半填严格"的 XOR 检查（此时 username/password 都空，
-  // 后端允许 = 首次启动空载，但 'token' 默认更直观）。
+  // xui form：v0.4 起仅 cookie 登录模式，固定字段集（无 auth_mode / api_token）。
   xui: {
     api_host: '',
     base_path: '',
-    auth_mode: 'token',
-    api_token: '',
     username: '',
     password: '',
     totp_secret: '',
@@ -147,7 +142,7 @@ onMounted(refresh)
       <div class="card">
         <h3 class="text-lg font-semibold mb-4">3x-ui 面板对接</h3>
         <p class="text-sm text-gray-600 mb-4">
-          如果你的 3x-ui 后台没有"API Token"卡片（多见于 fork 版本，<code class="bg-gray-100 px-1">strings | grep -ic apitoken</code> 输出 0），切到下方"账号密码"模式即可。
+          v0.4 起仅支持账号密码登录（cookie 模式）。Bearer Token 模式已移除——若你从 v0.2/v0.3 升级，旧的 <code class="bg-gray-100 px-1">api_token</code> 设置已被忽略，请在下方填 3x-ui 后台用户名 + 密码。
         </p>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
@@ -158,49 +153,27 @@ onMounted(refresh)
             <label class="label">base_path（webBasePath）</label>
             <input v-model="form.xui.base_path" class="input" placeholder="留空表示 /" />
           </div>
-          <!-- auth_mode 单选：决定下方 token / cookie 字段组的显示 -->
+          <div>
+            <label class="label">username（3x-ui 后台用户名）</label>
+            <input v-model="form.xui.username" class="input" autocomplete="off" />
+          </div>
+          <div>
+            <label class="label">password（3x-ui 后台密码）</label>
+            <input v-model="form.xui.password" type="password" class="input" autocomplete="new-password" />
+          </div>
           <div class="md:col-span-2">
-            <label class="label">auth_mode（鉴权模式）</label>
-            <div class="flex flex-wrap gap-x-6 gap-y-2 mt-1">
-              <label class="flex items-center gap-2">
-                <input type="radio" v-model="form.xui.auth_mode" value="token" />
-                <span class="text-sm">Bearer Token（推荐主线 3x-ui v2.4+）</span>
-              </label>
-              <label class="flex items-center gap-2">
-                <input type="radio" v-model="form.xui.auth_mode" value="cookie" />
-                <span class="text-sm">账号密码（兼容老 fork / 未启用 API Token 的部署）</span>
-              </label>
-            </div>
+            <label class="label">totp_secret（仅 3x-ui 启用了 2FA 时填；base32 secret）</label>
+            <input
+              v-model="form.xui.totp_secret"
+              type="password"
+              class="input"
+              placeholder="留空 = 未启用 2FA（默认情形）"
+              autocomplete="off"
+            />
+            <p class="text-xs text-gray-500 mt-1">
+              需保证本机系统时钟与 3x-ui 主机时钟相差小于 30 秒——TOTP 算法对时钟漂移敏感（依赖 NTP 同步）。
+            </p>
           </div>
-          <!-- token 模式专用字段 -->
-          <div v-if="form.xui.auth_mode === 'token'" class="md:col-span-2">
-            <label class="label">api_token（48 字符；3x-ui 后台 → 面板设置 → API Token）</label>
-            <input v-model="form.xui.api_token" class="input" />
-          </div>
-          <!-- cookie 模式专用字段 -->
-          <template v-if="form.xui.auth_mode === 'cookie'">
-            <div>
-              <label class="label">username（3x-ui 后台用户名）</label>
-              <input v-model="form.xui.username" class="input" autocomplete="off" />
-            </div>
-            <div>
-              <label class="label">password（3x-ui 后台密码）</label>
-              <input v-model="form.xui.password" type="password" class="input" autocomplete="new-password" />
-            </div>
-            <div class="md:col-span-2">
-              <label class="label">totp_secret（仅 3x-ui 启用了 2FA 时填；base32 secret）</label>
-              <input
-                v-model="form.xui.totp_secret"
-                type="password"
-                class="input"
-                placeholder="留空 = 未启用 2FA（默认情形）"
-                autocomplete="off"
-              />
-              <p class="text-xs text-gray-500 mt-1">
-                需保证本机系统时钟与 3x-ui 主机时钟相差小于 30 秒——TOTP 算法对时钟漂移敏感（依赖 NTP 同步）。
-              </p>
-            </div>
-          </template>
           <div>
             <label class="label">timeout_sec</label>
             <input v-model.number="form.xui.timeout_sec" type="number" min="1" class="input" />

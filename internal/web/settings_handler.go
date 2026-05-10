@@ -32,10 +32,8 @@ type settingsResponse struct {
 	Xui struct {
 		APIHost  string `json:"api_host"`
 		BasePath string `json:"base_path"`
-		AuthMode string `json:"auth_mode"`
-		APIToken string `json:"api_token"`
-		// v0.3 新增（仅 cookie 模式生效）。前端按 auth_mode 切换显示这三个字段；
-		// 与 api_token 同等敏感级别，admin 鉴权后明文回传——前端如需 mask 自行处理。
+		// v0.4 起仅 cookie 登录模式；admin 鉴权后明文回传 password / totp_secret，
+		// 前端如需 mask 自行处理（与 v0.2/v0.3 的 api_token 行为一致）。
 		Username      string `json:"username"`
 		Password      string `json:"password"`
 		TOTPSecret    string `json:"totp_secret"`
@@ -66,10 +64,11 @@ type settingsResponse struct {
 //   - 投影到 settingsResponse 结构（脱敏 + 字段过滤）；
 //   - 返回 200。
 //
-// 关键：xboard.token / xui.api_token 也在返回里——前端需要在编辑页
-// 显示 "已设置 (****)" 还是空。完整明文回传是有意为之，因为 Web 面板
-// 的访问者已经通过 admin 鉴权，他们本来就能看到一切凭据；前端如果
-// 担心展示就自己 mask 即可。
+// 关键：xboard.token / xui.password / xui.totp_secret 也在返回里——前端
+// 需要在编辑页显示 "已设置 (****)" 还是空。完整明文回传是有意为之，因为
+// Web 面板的访问者已经通过 admin 鉴权，他们本来就能看到一切凭据；前端
+// 如果担心展示就自己 mask 即可（password / totp_secret 已用 type=password
+// 默认隐藏字符）。
 //
 // 不直接读 store：supervisor.Snapshot 的好处是 cfg 已经过 LoadFromStore
 // + Validate，时间戳和默认值都已经规范化。
@@ -100,8 +99,6 @@ func projectSettings(cfg *config.Root) settingsResponse {
 
 	r.Xui.APIHost = cfg.Xui.APIHost
 	r.Xui.BasePath = cfg.Xui.BasePath
-	r.Xui.AuthMode = cfg.Xui.AuthMode
-	r.Xui.APIToken = cfg.Xui.APIToken
 	r.Xui.Username = cfg.Xui.Username
 	r.Xui.Password = cfg.Xui.Password
 	r.Xui.TOTPSecret = cfg.Xui.TOTPSecret
@@ -146,9 +143,7 @@ type settingsPatchRequest struct {
 	Xui *struct {
 		APIHost  *string `json:"api_host,omitempty"`
 		BasePath *string `json:"base_path,omitempty"`
-		AuthMode *string `json:"auth_mode,omitempty"`
-		APIToken *string `json:"api_token,omitempty"`
-		// v0.3 新增（仅 cookie 模式生效）；运行期可热重载，不在"重启生效"白名单内。
+		// v0.4 起仅 cookie 登录模式；运行期可热重载，不在"重启生效"白名单内。
 		Username      *string `json:"username,omitempty"`
 		Password      *string `json:"password,omitempty"`
 		TOTPSecret    *string `json:"totp_secret,omitempty"`
@@ -270,8 +265,6 @@ func buildSettingsKV(req settingsPatchRequest) map[string]string {
 	if req.Xui != nil {
 		setIfNotNil(kv, config.SettingXuiAPIHost, req.Xui.APIHost)
 		setIfNotNil(kv, config.SettingXuiBasePath, req.Xui.BasePath)
-		setIfNotNil(kv, config.SettingXuiAuthMode, req.Xui.AuthMode)
-		setIfNotNil(kv, config.SettingXuiAPIToken, req.Xui.APIToken)
 		setIfNotNil(kv, config.SettingXuiUsername, req.Xui.Username)
 		setIfNotNil(kv, config.SettingXuiPassword, req.Xui.Password)
 		setIfNotNil(kv, config.SettingXuiTOTPSecret, req.Xui.TOTPSecret)

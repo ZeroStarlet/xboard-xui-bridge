@@ -197,10 +197,15 @@ func runDaemon(args []string) {
 			"token_set", cfg.Xboard.Token != "",
 		)
 	}
-	if cfg.Xui.APIHost == "" || cfg.Xui.APIToken == "" {
+	// v0.4 起 xui 仅 cookie 登录模式：必须 api_host + username + password
+	// 都填齐才视为完整。复用 config.Xui.CredsComplete 与 supervisor /
+	// status_handler 共享同一份判定（不在此处手写 OR 表达式重蹈
+	// "凭据完整性灯不一致" 覆辙）。
+	if !cfg.Xui.CredsComplete() {
 		log.Warn("3x-ui 凭据未配置，请登录 Web 面板补齐后重启进程",
 			"api_host_set", cfg.Xui.APIHost != "",
-			"api_token_set", cfg.Xui.APIToken != "",
+			"username_set", cfg.Xui.Username != "",
+			"password_set", cfg.Xui.Password != "",
 		)
 	}
 
