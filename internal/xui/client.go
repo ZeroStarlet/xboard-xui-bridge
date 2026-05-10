@@ -103,8 +103,21 @@ func New(cfg config.Xui) (*Client, error) {
 
 // GetInbound 调用 GET /panel/api/inbounds/get/:id 获取单个 inbound 详情。
 //
-// 返回值的 ClientStats 字段已经被 3x-ui 后端用 enrichClientStats 填充
-// （UUID、订阅 ID 等运行时字段），可直接用于差量计算。
+// 返回值用途：本中间件仅在 user_sync 中使用其 RawSettings 字段（解析
+// settings.clients[*] 做托管 client diff），不读 ClientStats。
+//
+// 重要陷阱（v0.5.1 文档化）：3x-ui 主线 service.GetInbound(id) 的实现仅
+// 是 db.First(inbound, id)，**不调用 Preload("ClientStats") 也不调
+// enrichClientStats**——所以本端点返回的 JSON 里 clientStats 字段是 nil
+// 切片，UUID/SubID 也未被 enrich。如需"按 inbound 拉所有 client traffics"
+// 应改用 GetClientTrafficsByInboundID（v0.5.1 起内部走 /list 端点）。
+//
+// 老版本（v0.5 之前）注释一度写"ClientStats 已被 enrichClientStats 填充"，
+// 那是错的——只有 /list 端点对应的 GetInbounds(userId) / GetAllInbounds()
+// 才 Preload + enrich，单条 GetInbound(id) 一直没这个待遇。user_sync 只
+// 用 RawSettings 没暴露这个 bug；traffic_sync 与 alive_sync 之前调的是
+// /getClientTrafficsById/:id（且把 inbound id 当 client UUID 传错），所以
+// 也没踩到 GetInbound 的 ClientStats nil 陷阱——直到 v0.5.1 重新审视才发现。
 func (c *Client) GetInbound(ctx context.Context, id int) (*Inbound, error) {
 	endpoint := "/panel/api/inbounds/get/" + strconv.Itoa(id)
 	raw, err := c.do(ctx, http.MethodGet, endpoint, nil)
@@ -118,27 +131,98 @@ func (c *Client) GetInbound(ctx context.Context, id int) (*Inbound, error) {
 	return &ib, nil
 }
 
-// GetClientTrafficsByInboundID 调用 GET /panel/api/inbounds/getClientTrafficsById/:id。
+// GetClientTrafficsByInboundID 拉取指定 inbound 下所有 client 的流量统计。
 //
-// 与 GetInbound 区别：
+// v0.5.1 关键修复（v0.5 及之前一直误用，导致 Xboard 端流量永远 0）：
 //
-//	GetInbound                     返回 settings + clientStats，体积较大；
-//	GetClientTrafficsByInboundID   仅返回 clientStats，差量计算用它最划算。
+//	3x-ui 主线 GET /panel/api/inbounds/getClientTrafficsById/:id 的 :id
+//	**实际上是 client UUID（即 inbound.settings.clients[*].id 字段，UUID
+//	字符串）**，并不是 inbound id。3x-ui InboundService.GetClientTrafficByID
+//	内部 SQL（v3 主线 web/service/inbound.go）是：
+//
+//	    SELECT ... FROM client_traffics WHERE email IN (
+//	        SELECT JSON_EXTRACT(client.value, '$.email') AS email
+//	        FROM inbounds, JSON_EACH(JSON_EXTRACT(inbounds.settings, '$.clients')) AS client
+//	        WHERE JSON_EXTRACT(client.value, '$.id') in (?)
+//	    )
+//
+//	把 inbound id（如整数 1）以字符串 "1" 传进去，会与 settings.clients[*].id
+//	（UUID 字符串如 "550e8400-e29b-41d4-a716-446655440000"）做相等匹配——
+//	**永远匹配不到任何 client**，端点返回空数组。表现为 traffic_sync 循环
+//	zero 次进入、alive_sync myEmails 永远为空——直接造成 Xboard 用户 u/d
+//	永远 0 与 alive 永远空 push 这两个综合症状（v0.5 心跳让节点不再标
+//	"无人使用或异常"，但真实流量与在线 IP 数据从未抵达 Xboard）。
+//
+// 正确做法（v0.5.1 切换至 /list 端点）：
+//
+//	调 GET /panel/api/inbounds/list 走 3x-ui InboundService.GetInbounds(userId)；
+//	该方法用 db.Preload("ClientStats") 装载 HasMany 子记录，且后续 enrichClientStats
+//	会把每个 ClientStats 的 UUID/SubID 字段从 settings.clients 里反查填充——
+//	返回的每条 inbound.ClientStats 已经是"完全可用"状态。注意三件事：
+//
+//	  a) 不能用 GET /panel/api/inbounds/get/:id：3x-ui 主线 GetInbound(id)
+//	     仅 db.First(inbound, id)，**不 Preload ClientStats**。GORM 的
+//	     HasMany 关联仅靠 struct 标签不会自动加载子记录——必须显式 Preload。
+//	     该端点返回的 inbound.clientStats 始终是 nil 切片（user_sync 只读
+//	     RawSettings 没暴露这一陷阱，直到 v0.5.1 修复 traffic 流量 bug 时
+//	     被 Codex 审查发现）。详见 GetInbound 注释。
+//
+//	  b) /list 走 GetInbounds(userId) 用 WHERE user_id = ? **严格过滤**——
+//	     登录账户只能看到自己 user_id 下的 inbound（3x-ui 主线 controller
+//	     不对 admin 切换走 GetAllInbounds 分支）。生产部署必须让中间件
+//	     登录账户与目标 inbound 的所有者完全一致；多用户场景下若中间件
+//	     用子账户登录但目标 inbound 属于另一账户，user_sync 仍可能通过
+//	     /get/:id（不按 user_id 过滤）正常运行，traffic_sync 却永远从
+//	     /list 拿不到该 inbound——表现为"流量永远 0 + 节点状态正常"。
+//	     这种隐性不一致没法在中间件内自动检出，只能从"reported_users=0
+//	     + heartbeat_only=true 持续多周期 + Xboard 端真实流量为 0"反查权限。
+//
+//	  c) 体积权衡：拉所有 inbound 比单条 inbound 多带 N-1 倍 settings JSON。
+//	     3x-ui 一个面板典型 inbound 数 < 10、单 inbound client 数 < 数千，
+//	     /list 完整 JSON 通常 < 数百 KB；30s 一次的 traffic_sync 周期完全
+//	     可承受。如未来出现极端规模（万级 client），下个版本可换"先拉
+//	     /get/:id 取 settings.clients[*].email，再批量调 /getClientTraffics/:email"
+//	     的 N+1 路径——但当前阶段无此需求。
+//
+// 调用方契约不变：仍返回 []ClientTraffic。
+//   - 找到目标 inbound 且其 ClientStats 非空 → 真实流量列表
+//   - 找到目标 inbound 但 ClientStats 为空 → nil 切片。注意 3x-ui 在
+//     AddInboundClient 时通常会一并创建对应的 client_traffics 行（即使
+//     up/down 都是 0），所以正常运行下 ClientStats 不应为空；如果观察到
+//     非 0 用户数 inbound 仍返回空 stats，更可能是 inbound 刚建尚无 client、
+//     运维手动重置过 stats 表、或 /list 端 Preload 失败等异常情形——
+//     不视为合法的"客户全部从未连接"语义。
+//   - /list 响应中找不到目标 inbound id → nil 切片（运维配置或权限问题，调用
+//     方走心跳兜底；选择 nil 而非 sentinel error 是为了让 traffic_sync 在
+//     "inbound 临时缺失"时仍能维持节点 STATUS_ONLINE，而不是直接报错中断）
+//   - 网络 / 鉴权 / 5xx 错误 → 走 c.do 的标准错误链，向调用方传播
 func (c *Client) GetClientTrafficsByInboundID(ctx context.Context, inboundID int) ([]ClientTraffic, error) {
-	endpoint := "/panel/api/inbounds/getClientTrafficsById/" + strconv.Itoa(inboundID)
+	endpoint := "/panel/api/inbounds/list"
 	raw, err := c.do(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
-	// 极端情况下 obj 可能是 null（inbound 无 client 时）。
+	// 3x-ui 在用户没有 inbound 时返回 obj=null。统一收口为"无可用数据"
+	// 而非解码错误，让上层走"无 client"分支不被噪声打断。
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, nil
 	}
-	var out []ClientTraffic
-	if err := json.Unmarshal(raw, &out); err != nil {
+	var inbounds []Inbound
+	if err := json.Unmarshal(raw, &inbounds); err != nil {
 		return nil, fmt.Errorf("解码 %s 响应：%w", endpoint, err)
 	}
-	return out, nil
+	for _, ib := range inbounds {
+		if ib.ID == inboundID {
+			// 找到目标 inbound：返回其 ClientStats（已经被 Preload + enrich）。
+			// 切片可能 nil（无 client）——调用方按 nil/empty 处理即可，与
+			// "/list 中找不到目标 inbound"的语义合并是有意为之，详见函数头注释。
+			return ib.ClientStats, nil
+		}
+	}
+	// /list 不含目标 inbound id：返回 nil 切片（与"无 client"等价语义合并）。
+	// 不返回 error 是为了让 traffic_sync 进入心跳兜底维持节点 STATUS_ONLINE，
+	// 避免运维改动 inbound id / 改子账户权限期间节点直接被标"无人使用或异常"。
+	return nil, nil
 }
 
 // AddClient 调用 POST /panel/api/inbounds/addClient 新增一个或多个 client。

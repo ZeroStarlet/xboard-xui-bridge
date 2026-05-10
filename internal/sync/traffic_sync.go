@@ -22,6 +22,29 @@ import (
 //	b) 上报失败下个周期重传：reported 仅在 push 成功后推进，
 //	   失败则不动，差量天然单调递增。
 //
+// v0.5.1 关键修复（v0.5 之前真实流量从未抵达 Xboard 的根因）：
+//
+//	v0.5 心跳 push 让节点不再被标"无人使用或异常"，但 Xboard 的 已用流量 /
+//	u/d 字段始终为 0——根因不在 traffic_sync 自身，而是 xui.Client 调错了
+//	端点：旧版 GetClientTrafficsByInboundID 调用
+//	    GET /panel/api/inbounds/getClientTrafficsById/:id
+//	并把 inbound id 整数传进 :id；但 3x-ui 主线该端点的 :id **实际上是
+//	client UUID 字符串**，内部 SQL 用 JSON_EXTRACT(client.value, '$.id') in (?)
+//	做相等匹配，传 inbound id 永远 0 命中——返回空数组，traffic_sync 循环
+//	0 次进入，所有 skip 计数器为 0，最终 reported_users=0 + heartbeat_only=true。
+//
+//	v0.5.1 把内部实现切到 GET /panel/api/inbounds/list（3x-ui 服务层
+//	GetInbounds(userId) 显式 Preload("ClientStats") + enrichClientStats），
+//	遍历返回的 inbounds 数组取 ID == 目标 inboundID 那条的 ClientStats——
+//	这是 3x-ui 主线唯一保证 ClientStats 被装载的端点。/get/:id 看似更精确
+//	但其服务层 GetInbound(id) 仅 db.First(inbound, id)，**不 Preload**——
+//	返回的 inbound.clientStats 是 nil 切片，会让本修复无效。GORM HasMany
+//	关联仅靠 struct 标签不会自动加载子记录，必须显式 Preload。
+//
+//	调用方契约保持不变。注意 alive_sync 同样基于此方法过滤 myEmails，
+//	本次修复一并恢复其能力。详见 internal/xui/client.go
+//	GetClientTrafficsByInboundID 注释。
+//
 // 心跳 push（v0.5 起，修复"无人使用或异常"标黄 bug）：
 //
 //	Xboard 端 Server 模型 getAvailableStatusAttribute 的判定铁律：

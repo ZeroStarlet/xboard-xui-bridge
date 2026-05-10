@@ -62,7 +62,14 @@ type Inbound struct {
 	RawSettings    json.RawMessage `json:"settings"`        // 仍是 JSON 字符串而非对象
 	StreamSettings json.RawMessage `json:"streamSettings"`  // 同上
 	Sniffing       json.RawMessage `json:"sniffing"`        // 同上
-	ClientStats    []ClientTraffic `json:"clientStats"`     // GET inbound 时由 3x-ui 端 enrich
+	// ClientStats 仅在 /panel/api/inbounds/list 返回的 inbound 中可用——
+	// 3x-ui 主线 InboundService.GetInbounds(userId) 显式 Preload("ClientStats")
+	// 并跑 enrichClientStats 填充每条 stats 的 UUID/SubId 字段。
+	// /panel/api/inbounds/get/:id 走的 GetInbound(id) 仅 db.First(inbound, id)，
+	// **不 Preload**——该端点返回的 inbound JSON 里 clientStats 永远为 nil。
+	// 中间件按 inbound id 拉所有 client traffics 必须走 /list（详见
+	// client.go GetClientTrafficsByInboundID 注释及 v0.5.1 修复历史）。
+	ClientStats []ClientTraffic `json:"clientStats"`
 }
 
 // ClientTraffic 映射 3x-ui xray.ClientTraffic 模型，是流量统计的源数据。
