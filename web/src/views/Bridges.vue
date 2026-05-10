@@ -351,12 +351,17 @@ onMounted(refresh)
                   </div>
                   <div>
                     <label class="label" for="bridge-xboard-type">Xboard 节点类型</label>
-                    <input
+                    <select
                       id="bridge-xboard-type"
                       v-model="form.xboard_node_type"
                       class="input"
-                      placeholder="留空 = 按 protocol 推断"
-                    />
+                    >
+                      <!-- 空 value：与后端"留空 = 按 protocol 推断"语义直通；
+                           与 protocol 字段共享 protocols 常量保持 DRY，
+                           避免两处枚举漂移。 -->
+                      <option value="">留空 — 按 protocol 推断</option>
+                      <option v-for="p in protocols" :key="p" :value="p">{{ p }}</option>
+                    </select>
                   </div>
                 </div>
                 <div class="grid grid-cols-2 gap-4">
