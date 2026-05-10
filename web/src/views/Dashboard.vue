@@ -1,52 +1,83 @@
 <script setup lang="ts">
-// 仪表盘（v0.5 视觉重构）。
+// 仪表盘（v0.6 视觉重构 — shadcn-vue + i18n + 深色 + a11y）。
 //
 // 信息架构：
 //   - 顶部页面标题 + 操作区（刷新按钮）
-//   - KPI 区：4 张大数据卡（引擎状态 / 桥接 / 凭据 / 监听）—— 每张卡片有
-//     色彩化指标 + 图标徽标，运维一眼能看出系统状态。
-//   - 桥接概览表：复用 .data-table 视觉。
+//   - KPI 区：4 张大数据卡（引擎状态 / 桥接 / 凭据 / 监听）—— 每张卡片用
+//     Card + Badge 组件而非 v0.5 的自实现 .pill-* 类，深色模式自动语义切换
+//   - 桥接概览表：用 shadcn-vue Table 家族替代 v0.5 的 .data-table
 //
 // 视觉细节：
-//   - KPI 卡的图标徽章使用与状态匹配的色调（运行中=绿，未完整=琥珀，
-//     等等）——色彩比纯文字更快传达"是否健康"。
-//   - 加载态：用 skeleton 占位（KPI 卡灰底 + shimmer 动画），比"加载中…"
-//     文字感觉更专业。
+//   - KPI 卡的图标徽章使用与状态匹配的色调（运行中=绿，未完整=琥珀，等等）
+//   - 加载态用 Skeleton 占位，比"加载中…"文字更专业
+//   - 错误反馈走 toast 而非内嵌 alert（非阻塞，不打断浏览节奏）
+//
+// i18n：所有文案走 t()，包括表头 / 状态标签 / 空态提示。
 import { ref, onMounted, computed } from 'vue'
+import { useI18n } from 'vue-i18n'
+import { RefreshCw, Loader2, Play, Network, Shield, Globe, AlertCircle } from 'lucide-vue-next'
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
+import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
+import { Skeleton } from '@/components/ui/skeleton'
+import {
+  Table,
+  TableHeader,
+  TableBody,
+  TableRow,
+  TableHead,
+  TableCell,
+} from '@/components/ui/table'
+import { useToast } from '@/composables/useToast'
 import { api, type Status, type Bridge } from '@/api/client'
+
+const { t } = useI18n()
+const { toast } = useToast()
 
 const status = ref<Status | null>(null)
 const bridges = ref<Bridge[]>([])
 const loading = ref(true)
-const errMsg = ref('')
 
 async function refresh() {
   loading.value = true
-  errMsg.value = ''
   try {
     const [s, bs] = await Promise.all([api.getStatus(), api.listBridges()])
     status.value = s
     bridges.value = bs
   } catch (e) {
-    errMsg.value = '加载状态失败'
+    // toast 替代 v0.5 的内嵌 errMsg alert——不打断当前页面布局，让运维
+    // 看到红角通知就够了，无需保留错误横幅占位。
     console.warn(e)
+    toast({
+      title: t('errors.loadFailed'),
+      variant: 'destructive',
+    })
   } finally {
     loading.value = false
   }
 }
 
-// 派生：根据 status 字段计算各 KPI 的视觉状态（色调）。
-const engineState = computed(() => {
-  if (!status.value) return { text: '—', tone: 'neutral' }
+// 派生：根据 status 字段计算各 KPI 的视觉状态（Badge variant）。
+//
+// Badge variant 映射：
+//   running=true → success（brand 绿）
+//   running=false → destructive（rose 红）
+//   未加载（null）→ secondary（灰）
+//
+// 用 Badge variant 而非 v0.5 的 .pill-success / .pill-danger 等类，让深色
+// 模式自动跟随 token 切换，无需在视图里 if-else dark: 修饰符。
+const engineBadge = computed<{ variant: 'success' | 'destructive' | 'secondary'; labelKey: string }>(() => {
+  if (!status.value) return { variant: 'secondary', labelKey: 'common.dash' }
   return status.value.running
-    ? { text: '运行中', tone: 'success' }
-    : { text: '已停止', tone: 'danger' }
+    ? { variant: 'success', labelKey: 'common.running' }
+    : { variant: 'destructive', labelKey: 'common.stopped' }
 })
-const credsState = computed(() => {
-  if (!status.value) return { text: '—', tone: 'neutral' }
+
+const credsBadge = computed<{ variant: 'success' | 'warning' | 'secondary'; labelKey: string }>(() => {
+  if (!status.value) return { variant: 'secondary', labelKey: 'common.dash' }
   return status.value.creds_complete
-    ? { text: '已配置', tone: 'success' }
-    : { text: '未完整', tone: 'warning' }
+    ? { variant: 'success', labelKey: 'common.configured' }
+    : { variant: 'warning', labelKey: 'common.incomplete' }
 })
 
 onMounted(refresh)
@@ -57,215 +88,171 @@ onMounted(refresh)
     <!-- 页面头 -->
     <header class="mb-7 flex items-center justify-between">
       <div>
-        <h2 class="text-2xl font-semibold tracking-tight text-surface-900">仪表盘</h2>
-        <p class="mt-1 text-sm text-surface-500">实时查看引擎与桥接运行状态</p>
+        <h2 class="text-2xl font-semibold tracking-tight text-foreground">{{ t('dashboard.title') }}</h2>
+        <p class="mt-1 text-sm text-muted-foreground">{{ t('dashboard.subtitle') }}</p>
       </div>
-      <button class="btn-secondary" @click="refresh" :disabled="loading">
-        <svg
-          class="h-4 w-4"
-          :class="{ 'animate-spin': loading }"
-          fill="none"
-          viewBox="0 0 24 24"
-          stroke="currentColor"
-          stroke-width="1.75"
-          aria-hidden="true"
-        >
-          <path stroke-linecap="round" stroke-linejoin="round"
-            d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" />
-        </svg>
-        {{ loading ? '加载中…' : '刷新' }}
-      </button>
+      <Button variant="outline" :disabled="loading" @click="refresh">
+        <Loader2 v-if="loading" class="animate-spin" aria-hidden="true" />
+        <RefreshCw v-else aria-hidden="true" />
+        {{ loading ? t('common.loading') : t('common.refresh') }}
+      </Button>
     </header>
-
-    <!-- 错误提示 -->
-    <div v-if="errMsg" class="alert-error mb-6">
-      <svg class="h-5 w-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.75" aria-hidden="true">
-        <path stroke-linecap="round" stroke-linejoin="round"
-          d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
-      </svg>
-      <span>{{ errMsg }}</span>
-    </div>
 
     <!-- KPI 网格 -->
     <section class="mb-7 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
       <!-- 引擎状态卡 -->
-      <div class="kpi-card">
-        <div class="flex items-start justify-between">
-          <span class="kpi-label">引擎状态</span>
+      <Card>
+        <CardHeader class="flex flex-row items-start justify-between space-y-0 pb-2">
+          <CardDescription class="uppercase tracking-wider">{{ t('dashboard.engineState') }}</CardDescription>
           <span
             class="flex h-8 w-8 items-center justify-center rounded-lg"
-            :class="status?.running ? 'bg-brand-50 text-brand-600' : 'bg-rose-50 text-rose-600'"
+            :class="status?.running ? 'bg-brand-50 text-brand-600 dark:bg-brand-900/30 dark:text-brand-400' : 'bg-rose-50 text-rose-600 dark:bg-rose-900/30 dark:text-rose-400'"
+            aria-hidden="true"
           >
-            <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true">
-              <path stroke-linecap="round" stroke-linejoin="round" d="M5 3l14 9-14 9V3z" />
-            </svg>
+            <Play class="h-4 w-4" />
           </span>
-        </div>
-        <p
-          class="kpi-value"
-          :class="{
-            'text-brand-600': engineState.tone === 'success',
-            'text-rose-600': engineState.tone === 'danger',
-            'text-surface-400': engineState.tone === 'neutral',
-          }"
-        >
-          {{ engineState.text }}
-        </p>
-        <span
-          class="self-start"
-          :class="{
-            'pill-success': engineState.tone === 'success',
-            'pill-danger': engineState.tone === 'danger',
-            'pill-neutral': engineState.tone === 'neutral',
-          }"
-        >
-          <span class="pill-dot"></span>
-          <span>Supervisor</span>
-        </span>
-      </div>
+        </CardHeader>
+        <CardContent class="pt-2">
+          <Skeleton v-if="loading && !status" class="h-9 w-24" />
+          <p v-else class="text-3xl font-semibold tracking-tight text-foreground">
+            {{ t(engineBadge.labelKey) }}
+          </p>
+          <Badge :variant="engineBadge.variant" class="mt-2">
+            <span class="size-1.5 rounded-full bg-current" aria-hidden="true" />
+            {{ t('dashboard.engineSupervisor') }}
+          </Badge>
+        </CardContent>
+      </Card>
 
       <!-- 桥接卡 -->
-      <div class="kpi-card">
-        <div class="flex items-start justify-between">
-          <span class="kpi-label">启用桥接</span>
-          <span class="flex h-8 w-8 items-center justify-center rounded-lg bg-accent-50 text-accent-600">
-            <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true">
-              <path stroke-linecap="round" stroke-linejoin="round"
-                d="M13.19 8.688a4.5 4.5 0 011.242 7.244l-4.5 4.5a4.5 4.5 0 01-6.364-6.364l1.757-1.757m13.35-.622l1.757-1.757a4.5 4.5 0 00-6.364-6.364l-4.5 4.5a4.5 4.5 0 001.242 7.244" />
-            </svg>
+      <Card>
+        <CardHeader class="flex flex-row items-start justify-between space-y-0 pb-2">
+          <CardDescription class="uppercase tracking-wider">{{ t('dashboard.enabledBridges') }}</CardDescription>
+          <span class="flex h-8 w-8 items-center justify-center rounded-lg bg-info-50 text-info-600 dark:bg-info-900/30 dark:text-info-400" aria-hidden="true">
+            <Network class="h-4 w-4" />
           </span>
-        </div>
-        <p class="kpi-value">
-          <span>{{ status?.enabled_bridge_count ?? '—' }}</span>
-          <span class="text-base font-normal text-surface-400"> / {{ status?.total_bridge_count ?? '—' }}</span>
-        </p>
-        <span class="pill-info self-start">
-          <span class="pill-dot"></span>
-          <span>已激活同步</span>
-        </span>
-      </div>
+        </CardHeader>
+        <CardContent class="pt-2">
+          <Skeleton v-if="loading && !status" class="h-9 w-24" />
+          <p v-else class="text-3xl font-semibold tracking-tight text-foreground">
+            <span>{{ status?.enabled_bridge_count ?? t('common.dash') }}</span>
+            <span class="text-base font-normal text-muted-foreground"> / {{ status?.total_bridge_count ?? t('common.dash') }}</span>
+          </p>
+          <Badge variant="info" class="mt-2">
+            <span class="size-1.5 rounded-full bg-current" aria-hidden="true" />
+            {{ t('dashboard.activatedSync') }}
+          </Badge>
+        </CardContent>
+      </Card>
 
       <!-- 凭据卡 -->
-      <div class="kpi-card">
-        <div class="flex items-start justify-between">
-          <span class="kpi-label">凭据完整性</span>
+      <Card>
+        <CardHeader class="flex flex-row items-start justify-between space-y-0 pb-2">
+          <CardDescription class="uppercase tracking-wider">{{ t('dashboard.credsLabel') }}</CardDescription>
           <span
             class="flex h-8 w-8 items-center justify-center rounded-lg"
-            :class="status?.creds_complete ? 'bg-brand-50 text-brand-600' : 'bg-amber-50 text-amber-600'"
+            :class="status?.creds_complete ? 'bg-brand-50 text-brand-600 dark:bg-brand-900/30 dark:text-brand-400' : 'bg-amber-50 text-amber-600 dark:bg-amber-900/30 dark:text-amber-400'"
+            aria-hidden="true"
           >
-            <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true">
-              <path stroke-linecap="round" stroke-linejoin="round"
-                d="M9 12.75L11.25 15 15 9.75M21 12c0 1.268-.63 2.39-1.593 3.068a3.745 3.745 0 01-1.043 3.296 3.745 3.745 0 01-3.296 1.043A3.745 3.745 0 0112 21c-1.268 0-2.39-.63-3.068-1.593a3.746 3.746 0 01-3.296-1.043 3.745 3.745 0 01-1.043-3.296A3.745 3.745 0 013 12c0-1.268.63-2.39 1.593-3.068a3.745 3.745 0 011.043-3.296 3.746 3.746 0 013.296-1.043A3.746 3.746 0 0112 3c1.268 0 2.39.63 3.068 1.593a3.746 3.746 0 013.296 1.043 3.746 3.746 0 011.043 3.296A3.745 3.745 0 0121 12z" />
-            </svg>
+            <Shield class="h-4 w-4" />
           </span>
-        </div>
-        <p
-          class="kpi-value"
-          :class="{
-            'text-brand-600': credsState.tone === 'success',
-            'text-amber-600': credsState.tone === 'warning',
-            'text-surface-400': credsState.tone === 'neutral',
-          }"
-        >
-          {{ credsState.text }}
-        </p>
-        <span
-          class="self-start"
-          :class="{
-            'pill-success': credsState.tone === 'success',
-            'pill-warning': credsState.tone === 'warning',
-            'pill-neutral': credsState.tone === 'neutral',
-          }"
-        >
-          <span class="pill-dot"></span>
-          <span>Xboard / 3x-ui</span>
-        </span>
-      </div>
+        </CardHeader>
+        <CardContent class="pt-2">
+          <Skeleton v-if="loading && !status" class="h-9 w-24" />
+          <p v-else class="text-3xl font-semibold tracking-tight text-foreground">
+            {{ t(credsBadge.labelKey) }}
+          </p>
+          <Badge :variant="credsBadge.variant" class="mt-2">
+            <span class="size-1.5 rounded-full bg-current" aria-hidden="true" />
+            {{ t('dashboard.credsTarget') }}
+          </Badge>
+        </CardContent>
+      </Card>
 
       <!-- 监听地址卡 -->
-      <div class="kpi-card">
-        <div class="flex items-start justify-between">
-          <span class="kpi-label">监听地址</span>
-          <span class="flex h-8 w-8 items-center justify-center rounded-lg bg-violet-50 text-violet-600">
-            <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true">
-              <path stroke-linecap="round" stroke-linejoin="round"
-                d="M8.288 15.038a5.25 5.25 0 017.424 0M5.106 11.856c3.807-3.808 9.98-3.808 13.788 0M1.924 8.674c5.565-5.565 14.587-5.565 20.152 0M12.53 18.22l-.53.53-.53-.53a.75.75 0 011.06 0z" />
-            </svg>
+      <Card>
+        <CardHeader class="flex flex-row items-start justify-between space-y-0 pb-2">
+          <CardDescription class="uppercase tracking-wider">{{ t('dashboard.listenAddr') }}</CardDescription>
+          <span class="flex h-8 w-8 items-center justify-center rounded-lg bg-violet-50 text-violet-600 dark:bg-violet-900/30 dark:text-violet-400" aria-hidden="true">
+            <Globe class="h-4 w-4" />
           </span>
-        </div>
-        <p class="break-all font-mono text-base font-medium text-surface-800">
-          {{ status?.listen_addr || '—' }}
-        </p>
-        <span class="pill-info self-start">
-          <span class="pill-dot"></span>
-          <span>Web Panel</span>
-        </span>
-      </div>
+        </CardHeader>
+        <CardContent class="pt-2">
+          <Skeleton v-if="loading && !status" class="h-7 w-32" />
+          <p v-else class="break-all font-mono text-base font-medium text-foreground">
+            {{ status?.listen_addr || t('common.dash') }}
+          </p>
+          <Badge variant="info" class="mt-2">
+            <span class="size-1.5 rounded-full bg-current" aria-hidden="true" />
+            {{ t('dashboard.webPanel') }}
+          </Badge>
+        </CardContent>
+      </Card>
     </section>
 
     <!-- 桥接概览表格 -->
-    <section class="card">
-      <header class="section-title">
-        <span class="section-title-icon">
-          <svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.75" aria-hidden="true">
-            <path stroke-linecap="round" stroke-linejoin="round"
-              d="M3 7.5h18M3 12h18M3 16.5h18" />
-          </svg>
-        </span>
-        <div class="flex-1">
-          <h3 class="section-title-text">桥接概览</h3>
-          <p class="section-title-subtitle">所有已配置的 Xboard ↔ 3x-ui 桥接</p>
+    <Card>
+      <CardHeader>
+        <div class="flex items-center gap-3">
+          <span class="flex h-9 w-9 items-center justify-center rounded-xl bg-brand-50 text-brand-600 dark:bg-brand-900/30 dark:text-brand-400" aria-hidden="true">
+            <Network class="h-5 w-5" />
+          </span>
+          <div class="flex-1">
+            <CardTitle>{{ t('dashboard.bridgesOverview') }}</CardTitle>
+            <CardDescription>{{ t('dashboard.bridgesOverviewSubtitle') }}</CardDescription>
+          </div>
         </div>
-      </header>
+      </CardHeader>
+      <CardContent>
+        <!-- 空态：dashed border + 引导链接 -->
+        <div
+          v-if="!loading && bridges.length === 0"
+          class="rounded-xl border border-dashed bg-muted/30 px-6 py-10 text-center"
+        >
+          <AlertCircle class="mx-auto mb-3 h-10 w-10 text-muted-foreground" aria-hidden="true" />
+          <p class="text-sm text-foreground">{{ t('dashboard.emptyTitle') }}</p>
+          <p class="mt-1 text-xs text-muted-foreground">
+            <span>{{ t('dashboard.emptyHintPrefix') }}</span>
+            <RouterLink to="/bridges" class="font-medium text-primary hover:underline">
+              {{ t('dashboard.emptyHintLink') }}
+            </RouterLink>
+            <span>{{ t('dashboard.emptyHintSuffix') }}</span>
+          </p>
+        </div>
 
-      <div v-if="!loading && bridges.length === 0" class="rounded-xl border border-dashed border-surface-300 bg-surface-50/50 px-6 py-10 text-center">
-        <svg class="mx-auto mb-3 h-10 w-10 text-surface-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
-          <path stroke-linecap="round" stroke-linejoin="round"
-            d="M9.879 7.519c1.171-1.025 3.071-1.025 4.242 0 1.172 1.025 1.172 2.687 0 3.712-.203.179-.43.326-.67.442-.745.361-1.45.999-1.45 1.827v.75M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9 5.25h.008v.008H12v-.008z" />
-        </svg>
-        <p class="text-sm text-surface-600">尚未配置任何桥接</p>
-        <p class="mt-1 text-xs text-surface-500">
-          请前往 <RouterLink to="/bridges" class="font-medium text-brand-600 hover:text-brand-700">桥接管理</RouterLink> 添加。
-        </p>
-      </div>
-
-      <div v-else-if="bridges.length > 0" class="overflow-x-auto">
-        <table class="data-table">
-          <thead>
-            <tr>
-              <th>名称</th>
-              <th>协议</th>
-              <th>Xboard 节点</th>
-              <th>3x-ui inbound</th>
-              <th>状态</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="b in bridges" :key="b.name">
-              <td class="font-medium text-surface-900">{{ b.name }}</td>
-              <td>
-                <span class="font-mono text-[13px] text-surface-700">{{ b.protocol }}</span>
-                <span v-if="b.flow" class="ml-1 text-xs text-surface-500">({{ b.flow }})</span>
-              </td>
-              <td>
+        <!-- 表格 -->
+        <Table v-else-if="bridges.length > 0">
+          <TableHeader>
+            <TableRow>
+              <TableHead>{{ t('dashboard.tableName') }}</TableHead>
+              <TableHead>{{ t('dashboard.tableProtocol') }}</TableHead>
+              <TableHead>{{ t('dashboard.tableXboardNode') }}</TableHead>
+              <TableHead>{{ t('dashboard.tableXuiInbound') }}</TableHead>
+              <TableHead>{{ t('dashboard.tableState') }}</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            <TableRow v-for="b in bridges" :key="b.name">
+              <TableCell class="font-medium text-foreground">{{ b.name }}</TableCell>
+              <TableCell>
+                <span class="font-mono text-[13px]">{{ b.protocol }}</span>
+                <span v-if="b.flow" class="ml-1 text-xs text-muted-foreground">({{ b.flow }})</span>
+              </TableCell>
+              <TableCell>
                 <span class="font-mono text-[13px]">{{ b.xboard_node_id }}</span>
-                <span class="ml-1 text-xs text-surface-500">({{ b.xboard_node_type }})</span>
-              </td>
-              <td><span class="font-mono text-[13px]">{{ b.xui_inbound_id }}</span></td>
-              <td>
-                <span v-if="b.enable" class="pill-success">
-                  <span class="pill-dot"></span>
-                  <span>启用</span>
-                </span>
-                <span v-else class="pill-neutral">
-                  <span class="pill-dot"></span>
-                  <span>禁用</span>
-                </span>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
+                <span class="ml-1 text-xs text-muted-foreground">({{ b.xboard_node_type }})</span>
+              </TableCell>
+              <TableCell><span class="font-mono text-[13px]">{{ b.xui_inbound_id }}</span></TableCell>
+              <TableCell>
+                <Badge :variant="b.enable ? 'success' : 'secondary'">
+                  <span class="size-1.5 rounded-full bg-current" aria-hidden="true" />
+                  {{ b.enable ? t('common.enabled') : t('common.disabled') }}
+                </Badge>
+              </TableCell>
+            </TableRow>
+          </TableBody>
+        </Table>
+      </CardContent>
+    </Card>
   </div>
 </template>

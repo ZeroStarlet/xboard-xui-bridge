@@ -3,34 +3,172 @@
 @tailwind utilities;
 
 /*
- * 全局样式（v0.5 视觉重构）。
+ * 全局样式（v0.6 视觉重构 — shadcn-vue + Fluent Design + dark mode）。
  *
  * 设计令牌：把"颜色 / 圆角 / 阴影 / 间距"通过 Tailwind 主题（tailwind.config.js）
- * 集中管理；本文件只负责"语义化 utility"——比如 .card / .input / .btn-primary 等
- * 跨页面复用的小积木。这样新增页面时只需用积木拼装，不必每个组件重复贴长串
- * 原子 class——既符合 Tailwind 哲学（utility-first），又给项目留下明确的设计
- * 一致性边界。
+ * 集中管理。本文件职责：
+ *
+ *   a) 注入 HSL CSS variables（:root 亮色 + .dark 深色），shadcn-vue 组件
+ *      所有语义 token（bg-primary / text-foreground / border-border 等）
+ *      都从这里取值。深浅切换只换变量，组件代码无需感知。
+ *
+ *   b) 全局基线（body 字体 / 滚动条 / 焦点环）。
+ *
+ *   c) 项目历史 utility class（.card / .input / .btn-primary / .pill-* /
+ *      .alert-* / .data-table / .kpi-* 等）—— 这些类在 v0.6 过渡期仍被
+ *      旧视图引用，等批次 8-10 重写完所有视图后会逐步退役；当前保留并
+ *      迁移其内部 color 引用从 `accent-*` 到 `info-*`，保持深色模式下行为
+ *      一致（多数 utility 颜色仍是固定色阶，不跟随 .dark 切换——故旧视图
+ *      在深色模式下色调略浅，是有意的过渡态行为，重写后视图改用语义 token
+ *      即可自然深色）。
  */
 
-/* 全局基线 */
-html, body, #app {
-  height: 100%;
-  margin: 0;
+/* ============================================================
+ * HSL 语义 token 定义
+ * ----
+ * shadcn-vue 约定：所有语义颜色用 HSL 三元数（不带单位、不带 hsl() 包装）
+ * 写到 CSS variable 里，然后在 tailwind.config.js 的 colors.* 里用
+ * `hsl(var(--xxx))` 引用。这样可以在 utility 里用透明度修饰符：
+ *
+ *   bg-primary/50  →  hsl(var(--primary) / 0.5)
+ *
+ * 如果存成 #rrggbb 或完整 hsl() 字符串，bg-primary/50 会失效——这是
+ * shadcn 体系坚持 HSL 三元数表示法的核心原因。
+ *
+ * 亮色配色逻辑（Fluent 调性 + WCAG AA 兼容）：
+ *   - background：极浅蓝灰（surface-50 ≈ #f8fafc），非纯白避免反光刺眼
+ *   - foreground：深 slate（接近 #0f172a），高对比但不至于纯黑
+ *   - primary：emerald-700（≈ #047857）+ 白文字前景，对比度 ~5.6:1 过 AA。
+ *     之所以不用 brand-500（#10b981）：那个值与白字仅 ~2.5:1，远低于 AA
+ *     正文 4.5:1 阈值；视觉权衡见 token 处的注释。
+ *   - secondary/muted/accent：灰阶层级，做次级背景与文字
+ *   - destructive：rose-600（≈ #e11d48）+ 白文字前景，对比度 ~4.7:1 过 AA。
+ *     不用 rose-500（#f43f5e）：与白字 ~3.5:1（AA Large 过、AA 正文不过）。
+ *   - border/input：极浅灰（slate-200 ≈ #e2e8f0）
+ *   - ring：与 primary 同源（emerald-700），让所有 focus-visible 用同一品牌色
+ *
+ * 深色配色逻辑（Fluent dark surface + WCAG AA 兼容）：
+ *   - background：surface-950 极深蓝灰（接近 #020617）
+ *   - foreground：白偏冷（接近 #f1f5f9）
+ *   - card/popover：在 background 之上 +1 亮度档（#0f172a 系），让卡片
+ *     视觉浮起；与 background 拉开 1-2% 亮度即足，过亮会有"白卡浮在黑底"
+ *     的廉价感
+ *   - primary：emerald-400（深色下提亮一档保对比度）+ 深 foreground 文字
+ *     （白文字配 emerald-400 会刺眼，反而深底深字看起来更精致）
+ *   - secondary/muted/accent：在 background 之上 +2 亮度档，与卡片再拉开
+ *   - destructive：rose-800（#9f1239）+ 浅文字（slate-100），对比度 ~7.2:1
+ *     稳过 AAA。深色下不用 rose-400/500：那些与浅文字仅 ~2.5:1 不达 AA。
+ *   - border/input：与卡片拉开 +3 亮度档，分割线可见但不刺眼
+ *   - ring：与 primary 同源（emerald-400）
+ * ============================================================ */
+@layer base {
+  :root {
+    /* 亮色 token（默认）。所有数值是 HSL 三元数：色相(deg) 饱和度(%) 亮度(%) */
+
+    --background: 210 20% 98%;       /* slate-50 ≈ #f8fafc */
+    --foreground: 222 47% 11%;       /* slate-900 ≈ #0f172a */
+
+    --card: 0 0% 100%;               /* 纯白 */
+    --card-foreground: 222 47% 11%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+
+    /* primary: 选用 emerald-700（#047857）而非 emerald-500——后者
+     * (#10b981) + 白文字对比度仅 ~2.5:1，远低于 WCAG AA 正文要求的 4.5:1；
+     * emerald-700 + 白文字达到 ~5.6:1，稳过 AA。视觉上由"鲜亮翠绿"略
+     * 转为"深沉墨绿"，权衡之下：项目定位是运维后台，可访问性优先于
+     * 视觉鲜活度。.btn-primary 渐变端点同步上调到 brand-700 / brand-800
+     * 保持一致性。 */
+    --primary: 163 94% 24%;          /* emerald-700 ≈ #047857 */
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 210 40% 96%;        /* slate-100 ≈ #f1f5f9 */
+    --secondary-foreground: 222 47% 11%;
+
+    --muted: 210 40% 96%;
+    --muted-foreground: 215 16% 47%; /* slate-500 ≈ #64748b */
+
+    --accent: 210 40% 96%;
+    --accent-foreground: 222 47% 11%;
+
+    /* destructive: 选用 rose-600（#e11d48）而非 rose-500——后者
+     * (#f43f5e) + 白文字对比度仅 ~3.5:1（AA 大字 3:1 通过、AA 正文不通过）；
+     * rose-600 + 白文字达到 ~4.7:1 稳过 AA 正文。 */
+    --destructive: 347 77% 50%;      /* rose-600 ≈ #e11d48 */
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 214 32% 91%;           /* slate-200 ≈ #e2e8f0 */
+    --input:  214 32% 91%;
+    --ring:   163 94% 24%;           /* 与 primary 同源（focus 环用品牌色） */
+
+    --radius: 0.5rem;                /* 8px——Fluent 卡片标准 */
+  }
+
+  .dark {
+    /* 深色 token。亮度档梯度：background(4%) → card(7%) → muted(11%) → border(15%) */
+
+    --background: 222 47% 4%;        /* surface-950 ≈ #020617 */
+    --foreground: 210 40% 96%;       /* slate-100 ≈ #f1f5f9 */
+
+    --card: 222 47% 7%;              /* 比 background 亮 3% */
+    --card-foreground: 210 40% 96%;
+
+    --popover: 222 47% 7%;
+    --popover-foreground: 210 40% 96%;
+
+    /* 深色 primary：emerald-400 + 极深 foreground，对比度 ~11:1（AAA 等级）。
+     * 这里特意不沿用亮色的"深色 bg + 白字"策略——深底深字不可读，深底浅 bg
+     * + 深字反而是 Fluent 深色按钮的常见手法（视觉上像"亮起的发光按钮"）。 */
+    --primary: 158 64% 52%;          /* emerald-400 ≈ #34d399（深色下提亮） */
+    --primary-foreground: 222 47% 4%;
+
+    --secondary: 217 33% 11%;        /* surface-900 略亮 */
+    --secondary-foreground: 210 40% 96%;
+
+    --muted: 217 33% 11%;
+    --muted-foreground: 215 20% 65%;
+
+    --accent: 217 33% 11%;
+    --accent-foreground: 210 40% 96%;
+
+    /* 深色 destructive：rose-800（#9f1239）+ 浅 foreground（slate-100），
+     * 对比度 ~7.2:1（AAA 等级）。原方案 rose-400 + 浅文字仅 ~2.5:1 不达 AA。
+     * 选 rose-800 而非 rose-700 是因为深色面板背景已经偏暗（surface-950），
+     * rose-700 视觉上仍偏亮、与背景反差不足，rose-800 更稳重协调。 */
+    --destructive: 343 75% 35%;      /* rose-800 ≈ #9f1239 */
+    --destructive-foreground: 210 40% 96%;
+
+    --border: 217 33% 17%;           /* 比 card 亮 10%，分割可见但不喧宾夺主 */
+    --input:  217 33% 17%;
+    --ring:   158 64% 52%;
+  }
 }
 
-body {
-  /* 抗锯齿 + 字号优化：让中文 + 西文混排在所有平台都更精致。 */
-  font-family: 'Inter', 'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI',
-    'PingFang SC', 'Microsoft YaHei', 'Roboto', sans-serif;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  font-feature-settings: 'cv11', 'ss01';
-  /* 默认背景：极浅的青灰，比纯白更柔和；避免长时间凝视疲劳。 */
-  background-color: theme('colors.surface.50');
-  color: theme('colors.surface.800');
+/* ============================================================
+ * 全局基线
+ * ============================================================ */
+@layer base {
+  /* 让默认元素继承语义 token：bg-background/text-foreground 是 shadcn 约定 */
+  * {
+    border-color: hsl(var(--border));
+  }
+  html, body, #app {
+    height: 100%;
+    margin: 0;
+  }
+  body {
+    @apply bg-background text-foreground;
+    /* 抗锯齿 + 字号优化：让中文 + 西文混排在所有平台都更精致。 */
+    font-family: 'Inter', 'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI',
+      'PingFang SC', 'Microsoft YaHei', 'Roboto', sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-feature-settings: 'cv11', 'ss01';
+  }
 }
 
-/* 自定义滚动条——细且有品质感，与"上档次"目标一致。 */
+/* 自定义滚动条——细且有品质感，深色模式下用 .dark 的 muted 色阶。 */
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;
@@ -39,17 +177,19 @@ body {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background-color: theme('colors.surface.300');
+  background-color: hsl(var(--muted-foreground) / 0.30);
   border-radius: 9999px;
-  border: 2px solid theme('colors.surface.50');
+  border: 2px solid hsl(var(--background));
 }
 ::-webkit-scrollbar-thumb:hover {
-  background-color: theme('colors.surface.400');
+  background-color: hsl(var(--muted-foreground) / 0.50);
 }
 
-/* 焦点可见性——为键盘用户保留清晰焦点环，但用品牌色而非默认蓝色。 */
+/* 焦点可见性——为键盘用户保留清晰焦点环，用 ring 语义 token（= primary）。
+ * focus-visible 与传统 focus 的区别：仅在键盘聚焦（Tab/Shift+Tab）时显示，
+ * 鼠标点击聚焦不显示——避免点击按钮后留下视觉残留。 */
 *:focus-visible {
-  outline: 2px solid theme('colors.brand.500');
+  outline: 2px solid hsl(var(--ring));
   outline-offset: 2px;
   border-radius: 4px;
 }
@@ -64,22 +204,24 @@ button:focus-visible {
 @layer components {
   /* ============================================================
    * 卡片系统——三层语义：
-   *   .card        默认承载（白底 + 柔阴影 + 圆角 xl）
+   *   .card        默认承载（card 语义 + 柔阴影 + Fluent 圆角 lg=8px）
    *   .card-flat   嵌套区（无阴影 + 浅灰底，仅边框区分）
    *   .card-glass  玻璃拟态（登录页 / 强调浮层）
    * ============================================================ */
   .card {
-    @apply rounded-2xl border border-surface-200/80 bg-white p-6 shadow-soft transition-shadow;
+    @apply rounded-2xl border bg-card p-6 text-card-foreground shadow-soft transition-shadow;
   }
   .card:hover {
-    /* 微妙 hover：阴影加深一档让交互可感，避免"一动不动"的死板。 */
+    /* 微妙 hover：阴影加深一档让交互可感。 */
     box-shadow: 0 4px 16px -4px rgba(15, 23, 42, 0.10), 0 1px 4px 0 rgba(15, 23, 42, 0.05);
   }
   .card-flat {
-    @apply rounded-xl border border-surface-200 bg-surface-50 p-5;
+    /* 嵌套区——secondary 语义底色 + 标准边框 */
+    @apply rounded-xl border bg-secondary p-5 text-secondary-foreground;
   }
   .card-glass {
-    /* 玻璃拟态：半透明 + 模糊背景 + 内描边发光。仅在登录页等特殊场景用。 */
+    /* 玻璃拟态：半透明 + 模糊背景 + 内描边发光。仅在登录页等特殊场景用。
+     * 深色模式下背景透明度调低让光斑更醒目（深底背景下白色玻璃过亮）。 */
     @apply rounded-3xl border border-white/40 p-8;
     background-color: rgba(255, 255, 255, 0.70);
     backdrop-filter: blur(20px) saturate(160%);
@@ -88,50 +230,73 @@ button:focus-visible {
       0 24px 48px -12px rgba(15, 23, 42, 0.22),
       0 0 0 1px rgba(255, 255, 255, 0.40) inset;
   }
+  .dark .card-glass {
+    background-color: rgba(15, 23, 42, 0.60);
+    border-color: rgba(255, 255, 255, 0.10);
+    box-shadow:
+      0 24px 48px -12px rgba(0, 0, 0, 0.50),
+      0 0 0 1px rgba(255, 255, 255, 0.06) inset;
+  }
 
   /* ============================================================
    * 输入控件
    * ============================================================ */
   .input {
-    @apply w-full rounded-xl border border-surface-200 bg-white px-3.5 py-2.5 text-sm text-surface-800
-           placeholder:text-surface-400 transition-all duration-150
-           hover:border-surface-300
-           focus:border-brand-500 focus:outline-none focus:shadow-glow;
+    @apply w-full rounded-xl border bg-background px-3.5 py-2.5 text-sm text-foreground
+           placeholder:text-muted-foreground transition-all duration-150
+           hover:border-muted-foreground/40
+           focus:border-ring focus:outline-none focus:shadow-glow;
   }
   .input:disabled {
-    @apply cursor-not-allowed bg-surface-100 text-surface-500;
+    @apply cursor-not-allowed bg-muted text-muted-foreground;
   }
   .input-mono {
     @apply font-mono text-[13px];
   }
   .label {
-    @apply mb-1.5 block text-[13px] font-medium text-surface-700;
+    @apply mb-1.5 block text-[13px] font-medium text-foreground;
   }
   .help-text {
-    @apply mt-1.5 text-xs text-surface-500;
+    @apply mt-1.5 text-xs text-muted-foreground;
   }
 
   /* ============================================================
    * 按钮系统——主 / 次 / 危险 / 幽灵 四种语义。
-   * 所有按钮共享 .btn 基础类（尺寸 + 过渡）；颜色由变体类提供。
    *
-   * 设计选择：渐变色让主按钮更"上档次"；hover 时阴影加深 + 微 scale，
-   * 给运维"按下去能感受到反馈"的物理层面满足感。
+   * 设计选择：渐变色让主按钮更"上档次"，与项目品牌色保持视觉一致；
+   * Fluent 体系本身偏向扁平按钮，但项目自 v0.5 已建立"emerald 渐变"
+   * 视觉记忆，v0.6 沿用——美学连续性优先于 design system 教条。
    * ============================================================ */
   .btn {
+    /* ring-offset-background：深色模式下 ring 与按钮间的 2px 间隙不再是
+     * 默认白色（在深底上突兀），而是跟随 background 语义自动深色。
+     * 亮色模式下 background ≈ surface-50，与按钮区分仍清晰；深色模式下
+     * background ≈ surface-950，offset 几乎隐形，焦点环视觉聚焦更纯粹。 */
     @apply inline-flex items-center justify-center gap-1.5 rounded-xl px-4 py-2 text-sm font-medium
            transition-all duration-150 ease-out
            disabled:cursor-not-allowed disabled:opacity-50
-           focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2;
+           focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2
+           focus-visible:ring-offset-background focus-visible:ring-ring;
   }
+  /* btn-primary 渐变端点：v0.6 上调到 brand-700 → brand-800
+   *
+   *   原 v0.5 用 brand-500 → brand-600 渐变，亮端 emerald-500 (#10b981)
+   *   + 白文字对比度仅 ~2.5:1，远低于 WCAG AA 4.5:1 阈值。整体上调一档：
+   *
+   *     - brand-700 (#047857) + 白：~5.6:1 ✅
+   *     - brand-800 (#065f46) + 白：~7.0:1 ✅
+   *
+   *   视觉权衡：颜色由"鲜亮翠绿"略转为"深沉墨绿"，但运维后台对可访问性
+   *   的优先级高于视觉鲜活度（Rule 9 安全 > 性能/美学）。
+   *   hover 态再深一档（brand-800 → brand-900），强化"按下去更深"的物理直觉。 */
   .btn-primary {
-    @apply btn text-white focus-visible:ring-brand-500;
-    background-image: linear-gradient(135deg, theme('colors.brand.500'), theme('colors.brand.600'));
+    @apply btn text-white;
+    background-image: linear-gradient(135deg, theme('colors.brand.700'), theme('colors.brand.800'));
     box-shadow: 0 1px 2px 0 rgba(15, 23, 42, 0.05);
   }
   .btn-primary:hover:not(:disabled) {
-    background-image: linear-gradient(135deg, theme('colors.brand.600'), theme('colors.brand.700'));
-    box-shadow: 0 4px 12px -2px rgba(16, 185, 129, 0.40);
+    background-image: linear-gradient(135deg, theme('colors.brand.800'), theme('colors.brand.900'));
+    box-shadow: 0 4px 12px -2px rgba(4, 120, 87, 0.40);
     transform: translateY(-1px);
   }
   .btn-primary:active:not(:disabled) {
@@ -139,54 +304,66 @@ button:focus-visible {
     box-shadow: 0 1px 2px 0 rgba(15, 23, 42, 0.05);
   }
   .btn-secondary {
-    @apply btn border border-surface-200 bg-white text-surface-700
-           hover:border-surface-300 hover:bg-surface-50 hover:text-surface-900
-           focus-visible:ring-surface-400;
+    @apply btn border bg-card text-foreground
+           hover:bg-secondary hover:text-foreground;
   }
+  /* btn-danger：同样上调一档。原 rose-500 (#f43f5e) 对比度 3.5:1（AA 不过），
+   * rose-600 (#e11d48) 4.7:1 ✅ AA 过；rose-700 (#be123c) 6+:1 ✅ AAA 过。 */
   .btn-danger {
-    @apply btn text-white focus-visible:ring-rose-500;
-    background-image: linear-gradient(135deg, theme('colors.rose.500'), theme('colors.rose.600'));
+    @apply btn text-white;
+    background-image: linear-gradient(135deg, theme('colors.rose.600'), theme('colors.rose.700'));
   }
   .btn-danger:hover:not(:disabled) {
-    background-image: linear-gradient(135deg, theme('colors.rose.600'), theme('colors.rose.700'));
-    box-shadow: 0 4px 12px -2px rgba(244, 63, 94, 0.40);
+    background-image: linear-gradient(135deg, theme('colors.rose.700'), theme('colors.rose.800'));
+    box-shadow: 0 4px 12px -2px rgba(225, 29, 72, 0.40);
     transform: translateY(-1px);
   }
   .btn-ghost {
-    /* 幽灵按钮——卡片内 / 工具栏内的轻量按钮，悬停才出现填充。 */
-    @apply btn bg-transparent text-surface-600 hover:bg-surface-100 hover:text-surface-900;
+    /* 幽灵按钮——卡片内 / 工具栏内的轻量按钮。 */
+    @apply btn bg-transparent text-muted-foreground hover:bg-secondary hover:text-foreground;
   }
   .btn-sm {
     @apply px-3 py-1.5 text-[13px];
   }
   .btn-icon {
     /* 纯图标按钮——正方形、无内边距文本、悬停高亮。 */
-    @apply inline-flex h-9 w-9 items-center justify-center rounded-lg text-surface-500
+    @apply inline-flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground
            transition-colors duration-150
-           hover:bg-surface-100 hover:text-surface-800
-           focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500;
+           hover:bg-secondary hover:text-foreground
+           focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring;
   }
 
   /* ============================================================
    * 复选框——.cb 是项目统一的"原生 checkbox 着色"约定。
    *
    * 设计动机：原生 input[type=checkbox] 的勾选色在大多数浏览器都是系统蓝色；
-   * 想让它跟品牌色（brand 绿）一致，最简单的方式是 CSS accent-color 属性
-   * （Chrome 93+ / Firefox 92+ / Safari 15.4+，2021 年后全平台支持）。
-   * Tailwind 通过 accent-* 工具类映射到该属性。
+   * 想让它跟品牌色一致，最简单的方式是 CSS accent-color 属性（Chrome 93+ /
+   * Firefox 92+ / Safari 15.4+，2021 年后全平台支持）。Tailwind 通过 accent-*
+   * 工具类映射到该属性。
    *
-   * 不引入第三方 forms 插件（如 @tailwindcss/forms）的原因：插件会接管所有
-   * input/select 的默认样式，本项目自定义 .input 已经一致，没必要再叠加。
+   * 用 accent-primary 而非 accent-brand-500：accent-color 接受任何合法 CSS
+   * <color> 值，包括 hsl(var(--primary)) 这类运行时变量（CSS Color Module 4
+   * + var() 标准都支持），所以走语义 token 是安全的。这样深色模式下原生
+   * checkbox 的勾选色自动从 emerald-700 切到 emerald-400，与按钮 / focus 环
+   * 同步——无需额外深色覆写。
+   *
+   * focus-visible:ring-offset-background：深色模式下默认 ring-offset 是
+   * 白色（与浅色 background 同），这条让 offset 跟随 background 语义，
+   * 在深色面板上不再露出突兀白边。
    * ============================================================ */
   .cb {
-    @apply h-4 w-4 rounded border-surface-300 accent-brand-500
+    @apply h-4 w-4 rounded border-input accent-primary
            transition-colors duration-150
-           focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2;
+           focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring
+           focus-visible:ring-offset-2 focus-visible:ring-offset-background;
   }
 
   /* ============================================================
    * 状态徽章（pill）——用于"启用 / 禁用 / 运行中 / 已停止"等小状态标签。
    * 每个变体都是 dot + 文本的组合，dot 提供色彩瞬时识别。
+   *
+   * v0.6 迁移：原 .pill-info 引用 colors.accent.*（蓝色）改为 colors.info.*，
+   * 与 tailwind.config.js 的色板重命名同步。视觉无变化（蓝色调一致）。
    * ============================================================ */
   .pill {
     @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium;
@@ -207,17 +384,19 @@ button:focus-visible {
   }
   .pill-danger .pill-dot { @apply bg-rose-500; }
   .pill-neutral {
-    @apply pill bg-surface-100 text-surface-600 ring-1 ring-inset ring-surface-200;
+    @apply pill bg-secondary text-muted-foreground ring-1 ring-inset ring-border;
   }
-  .pill-neutral .pill-dot { @apply bg-surface-400; }
+  .pill-neutral .pill-dot { @apply bg-muted-foreground/60; }
   .pill-info {
-    @apply pill bg-accent-50 text-accent-700 ring-1 ring-inset ring-accent-200;
+    @apply pill bg-info-50 text-info-700 ring-1 ring-inset ring-info-200;
   }
-  .pill-info .pill-dot { @apply bg-accent-500; }
+  .pill-info .pill-dot { @apply bg-info-500; }
 
   /* ============================================================
    * 警示横幅（提示性消息条）——alert
    * 与 pill 区分：横幅承载较多文字，pill 仅是 1 词标签。
+   *
+   * v0.6 迁移：原 .alert-info 引用 accent-* 改为 info-*。
    * ============================================================ */
   .alert {
     @apply flex items-start gap-3 rounded-xl border p-4 text-sm;
@@ -225,7 +404,7 @@ button:focus-visible {
   .alert-error   { @apply alert border-rose-200 bg-rose-50 text-rose-800; }
   .alert-success { @apply alert border-brand-200 bg-brand-50 text-brand-800; }
   .alert-warning { @apply alert border-amber-200 bg-amber-50 text-amber-800; }
-  .alert-info    { @apply alert border-accent-200 bg-accent-50 text-accent-800; }
+  .alert-info    { @apply alert border-info-200 bg-info-50 text-info-800; }
 
   /* ============================================================
    * 表格语义类——data-table。
@@ -235,11 +414,11 @@ button:focus-visible {
     @apply w-full text-sm;
   }
   .data-table thead th {
-    @apply text-left text-[12px] font-semibold uppercase tracking-wider text-surface-500
-           py-3 px-4 border-b border-surface-200;
+    @apply text-left text-[12px] font-semibold uppercase tracking-wider text-muted-foreground
+           py-3 px-4 border-b;
   }
   .data-table tbody td {
-    @apply py-3 px-4 text-surface-700 border-b border-surface-100;
+    @apply py-3 px-4 text-foreground border-b border-border/60;
   }
   .data-table tbody tr:last-child td {
     @apply border-b-0;
@@ -248,7 +427,7 @@ button:focus-visible {
     @apply transition-colors duration-100;
   }
   .data-table tbody tr:hover {
-    @apply bg-surface-50;
+    @apply bg-secondary;
   }
 
   /* ============================================================
@@ -262,10 +441,10 @@ button:focus-visible {
     @apply flex h-9 w-9 items-center justify-center rounded-xl bg-brand-50 text-brand-600;
   }
   .section-title-text {
-    @apply text-base font-semibold text-surface-800;
+    @apply text-base font-semibold text-foreground;
   }
   .section-title-subtitle {
-    @apply text-xs text-surface-500;
+    @apply text-xs text-muted-foreground;
   }
 
   /* ============================================================
@@ -275,10 +454,34 @@ button:focus-visible {
     @apply card flex flex-col gap-2 overflow-hidden;
   }
   .kpi-label {
-    @apply text-xs font-medium uppercase tracking-wider text-surface-500;
+    @apply text-xs font-medium uppercase tracking-wider text-muted-foreground;
   }
   .kpi-value {
-    @apply text-3xl font-semibold tracking-tight text-surface-900;
+    @apply text-3xl font-semibold tracking-tight text-foreground;
+  }
+
+  /* ============================================================
+   * Fluent 风扩展——mica 主面板背景层
+   *
+   * Fluent Design 的"Mica"是一种半透明背景效果，使 Win11 应用窗口
+   * 透出桌面壁纸的色调。Web 上无法读取桌面，本工具类用极淡的色彩渐变
+   * 模拟 Mica 的"层次感"：在 surface 之上叠加一层 1-2% 透明的 brand 与
+   * info 渐变，让大面板（如登录页背景、主面板内容区）有微妙的层次而
+   * 不显寡淡。
+   *
+   * 用法：在最外层 wrapper 加 .mica-bg；不要叠在卡片或文字之上。
+   * ============================================================ */
+  .mica-bg {
+    background:
+      radial-gradient(ellipse at top right, rgba(16, 185, 129, 0.04), transparent 50%),
+      radial-gradient(ellipse at bottom left, rgba(59, 130, 246, 0.04), transparent 50%),
+      hsl(var(--background));
+  }
+  .dark .mica-bg {
+    background:
+      radial-gradient(ellipse at top right, rgba(52, 211, 153, 0.06), transparent 50%),
+      radial-gradient(ellipse at bottom left, rgba(96, 165, 250, 0.06), transparent 50%),
+      hsl(var(--background));
   }
 }
 
@@ -293,9 +496,11 @@ button:focus-visible {
     white-space: nowrap;
     width: 1px;
   }
-  /* 渐变文字——主标题 / Logo 用。 */
+  /* 渐变文字——主标题 / Logo 用。
+   * v0.6 迁移：原 from brand to accent 改为 from brand to info（color rename
+   * 同步），渲染色调不变（emerald → blue 渐变）。 */
   .text-gradient-brand {
-    background-image: linear-gradient(135deg, theme('colors.brand.500'), theme('colors.accent.500'));
+    background-image: linear-gradient(135deg, theme('colors.brand.500'), theme('colors.info.500'));
     -webkit-background-clip: text;
     background-clip: text;
     -webkit-text-fill-color: transparent;

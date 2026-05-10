@@ -1,17 +1,24 @@
 {
   "name": "xboard-xui-bridge-web",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.6.0",
   "type": "module",
-  "description": "Web GUI for xboard-xui-bridge — Vue 3 + Vite + Tailwind. Built artifacts copied into ../internal/web/dist/ for go:embed.",
+  "description": "Web GUI for xboard-xui-bridge — Vue 3 + Vite + Tailwind + shadcn-vue + vue-i18n. Built artifacts copied into ../internal/web/dist/ for go:embed.",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
     "preview": "vite preview"
   },
   "dependencies": {
+    "@vueuse/core": "^14.3.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-vue-next": "^1.0.0",
     "pinia": "^2.1.7",
+    "reka-ui": "^2.9.7",
+    "tailwind-merge": "^2.6.1",
     "vue": "^3.4.27",
+    "vue-i18n": "^11.4.2",
     "vue-router": "^4.3.2"
   },
   "devDependencies": {
@@ -21,6 +28,7 @@
     "autoprefixer": "^10.4.19",
     "postcss": "^8.4.38",
     "tailwindcss": "^3.4.4",
+    "tailwindcss-animate": "^1.0.7",
     "typescript": "~5.4.5",
     "vite": "^5.2.11",
     "vue-tsc": "^2.0.16"

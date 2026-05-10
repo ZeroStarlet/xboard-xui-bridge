@@ -1,19 +1,38 @@
 <script setup lang="ts">
-// 登录页（v0.5 视觉重构）。
+// 登录页（v0.6 视觉重构 — shadcn-vue + i18n + 深色 + WCAG AA 强化）。
 //
 // 视觉策略：
-//   - 玻璃拟态卡片（card-glass）—— 半透明 + 模糊背景，让 App.vue 渲染的渐变光斑
-//     透过卡片视觉若隐若现，营造"高端"感。
-//   - 顶部渐变图标——用 SVG 内嵌 + linearGradient 让 logo 也有渐变品牌色，
-//     与导航栏的渐变文字呼应。
-//   - 输入框焦点态用 ring-glow（绿色弥散光）—— 区别于浏览器默认蓝色焦点环，
-//     让用户感知"这是我们的设计"。
-//   - 按钮 loading 态用旋转 spinner——比纯文字"登录中…"更专业。
-import { ref } from 'vue'
+//   - 玻璃拟态卡片（card-glass）—— v0.5 视觉资产保留：半透明 + 模糊背景，
+//     让 App.vue 渲染的渐变光斑透过卡片若隐若现，营造"高端"感。深色模式
+//     由 .dark .card-glass 已在 style.css 适配（透明度调低让深底光斑更醒目）。
+//   - 渐变 logo 图标——外层 div 用 CSS linear-gradient 渲染品牌色背景，
+//     内嵌 lucide-vue-next 的 Zap 图标做闪电纹饰，意指"中间件 / 桥接"。
+//     v0.5 用 SVG 内嵌 path，v0.6 改为 lucide 组件让源码更干净（path 数据
+//     不再硬编码在模板内）。
+//   - 输入控件用 shadcn-vue Input + Label 组件，焦点环用 ring 语义 token，
+//     深色模式 ring-offset 跟随 background。
+//   - 按钮 loading 态用旋转 spinner（lucide Loader2），比纯文字更专业。
+//
+// i18n：所有文案走 t()，包括 aria-label、placeholder、错误提示。
+//
+// 可访问性（WCAG AA 强化）：
+//   - 错误横幅（Alert）role="alert" + aria-live="assertive" 让屏幕阅读器
+//     立刻播报错误内容
+//   - 按钮 loading 时 aria-busy + aria-live="polite" 让"登录中…"被朗读
+//   - autofocus 在用户名输入框，避免每次进入页面都需要鼠标点击
+//   - autocomplete 属性正确设置（username / current-password），让浏览器
+//     密码管理器与 1Password 等 helper 自动填充
+import { ref, computed } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { useRouter, useRoute } from 'vue-router'
+import { Loader2, Zap, AlertCircle } from 'lucide-vue-next'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import { useAuthStore } from '@/stores/auth'
-import { ApiError } from '@/api/client'
 
+const { t } = useI18n()
 const router = useRouter()
 const route = useRoute()
 const auth = useAuthStore()
@@ -23,10 +42,15 @@ const password = ref('')
 const errorMsg = ref('')
 const loading = ref(false)
 
+// loading button 的 aria 属性派生——避免在模板里写多个三元表达式。
+const submitButtonLabel = computed(() =>
+  loading.value ? t('login.submitting') : t('login.submit'),
+)
+
 async function submit() {
   errorMsg.value = ''
   if (!username.value || !password.value) {
-    errorMsg.value = '请输入用户名与密码'
+    errorMsg.value = t('login.errEmpty')
     return
   }
   loading.value = true
@@ -35,11 +59,17 @@ async function submit() {
     const redirect = (route.query.redirect as string) || '/dashboard'
     router.push(redirect)
   } catch (e) {
-    if (e instanceof ApiError) {
-      errorMsg.value = e.message
-    } else {
-      errorMsg.value = '登录失败，请检查网络'
-    }
+    // 错误显示策略：v0.5 把 ApiError.message（后端原始中文）直接显示给用户，
+    // 但英文界面就会看到非本地化中文（"用户名或密码错误"等）。v0.6 起统一
+    // 走 t('login.errFailed') 让显示语言与界面 locale 一致；代价是损失服务端
+    // 给出的具体错误码（"密码错误" vs "用户被锁定"）的细颗粒度反馈。
+    //
+    // 后续改进路径：在 zh-CN/en-US locale 里按 e.code 映射不同 key
+    // （e.g. login.errInvalidCreds / login.errRateLimited），让英文用户也
+    // 能看到具体原因。短期内（本批次）保持简单——任何登录失败都显示同一
+    // 通用文案，与现有后端"登录失败 401"主流场景吻合。
+    void e
+    errorMsg.value = t('login.errFailed')
   } finally {
     loading.value = false
   }
@@ -50,99 +80,77 @@ async function submit() {
   <div class="card-glass">
     <!-- Logo + 标题 -->
     <div class="mb-8 flex flex-col items-center text-center">
-      <!-- 渐变 logo 图标：圆角方形 + 闪电纹饰，意指"中间件 / 桥接"。 -->
+      <!-- 渐变 logo 图标：圆角方形 + 闪电纹饰，意指"中间件 / 桥接"。
+           lucide Zap 图标替代 v0.5 的内联 SVG path，源码更干净。 -->
       <div class="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl shadow-soft"
            style="background: linear-gradient(135deg, #10b981, #3b82f6);">
-        <svg
-          class="h-7 w-7 text-white"
-          fill="none"
-          viewBox="0 0 24 24"
-          stroke="currentColor"
-          stroke-width="2"
-          aria-hidden="true"
-        >
-          <path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
-        </svg>
+        <Zap class="h-7 w-7 text-white" stroke-width="2" aria-hidden="true" />
       </div>
-      <h1 class="text-xl font-semibold tracking-tight text-surface-900">
+      <h1 class="text-xl font-semibold tracking-tight text-foreground">
         <span class="text-gradient-brand">xboard-xui-bridge</span>
       </h1>
-      <p class="mt-1.5 text-sm text-surface-500">管理面板登录</p>
+      <p class="mt-1.5 text-sm text-muted-foreground">{{ t('login.title') }}</p>
     </div>
 
     <!-- 表单 -->
-    <form @submit.prevent="submit" class="space-y-5">
+    <form @submit.prevent="submit" class="space-y-5" novalidate>
       <div>
-        <label class="label" for="login-username">用户名</label>
-        <input
+        <Label for="login-username">{{ t('login.username') }}</Label>
+        <Input
           id="login-username"
           v-model="username"
-          class="input"
           autocomplete="username"
           required
           autofocus
+          class="mt-1.5"
         />
       </div>
       <div>
-        <label class="label" for="login-password">密码</label>
-        <input
+        <Label for="login-password">{{ t('login.password') }}</Label>
+        <Input
           id="login-password"
           v-model="password"
           type="password"
-          class="input"
           autocomplete="current-password"
           required
+          class="mt-1.5"
         />
       </div>
 
-      <!-- 错误提示——使用 alert-error 横幅，与全局警示视觉风格一致。 -->
-      <div v-if="errorMsg" class="alert-error">
-        <svg
-          class="h-5 w-5 shrink-0"
-          fill="none"
-          viewBox="0 0 24 24"
-          stroke="currentColor"
-          stroke-width="2"
-          aria-hidden="true"
-        >
-          <path
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z"
-          />
-        </svg>
-        <span>{{ errorMsg }}</span>
-      </div>
+      <!--
+        错误提示：用 shadcn-vue Alert（destructive variant）+ role="alert" +
+        aria-live="assertive"，让屏幕阅读器在错误出现时立刻播报。
+        v-if 让 alert 仅在错误存在时挂载，避免 aria-live 在空文本上反复触发。
+      -->
+      <Alert v-if="errorMsg" variant="destructive" role="alert" aria-live="assertive">
+        <AlertCircle />
+        <AlertDescription>{{ errorMsg }}</AlertDescription>
+      </Alert>
 
-      <button type="submit" class="btn-primary w-full justify-center" :disabled="loading">
-        <!-- loading 态用旋转图标 + 文字，比纯文字更专业。 -->
-        <svg
-          v-if="loading"
-          class="h-4 w-4 animate-spin"
-          fill="none"
-          viewBox="0 0 24 24"
-          aria-hidden="true"
-        >
-          <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" />
-          <path
-            class="opacity-75"
-            fill="currentColor"
-            d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-          />
-        </svg>
-        <span>{{ loading ? '登录中…' : '登录' }}</span>
-      </button>
+      <Button
+        type="submit"
+        class="w-full"
+        :disabled="loading"
+        :aria-busy="loading"
+        aria-live="polite"
+      >
+        <Loader2 v-if="loading" class="animate-spin" aria-hidden="true" />
+        <span>{{ submitButtonLabel }}</span>
+      </Button>
     </form>
 
-    <!-- 首次启动提示 -->
-    <div class="mt-7 rounded-xl border border-surface-200 bg-surface-50/80 px-4 py-3">
-      <p class="text-xs leading-relaxed text-surface-600">
-        <span class="font-medium text-surface-700">首次登录提示：</span>
-        密码会写入服务器日志与
-        <code class="rounded bg-surface-200 px-1.5 py-0.5 font-mono text-[11px] text-surface-700">
-          data/initial_password.txt
+    <!--
+      首次启动提示：用三段式拼接（prefix + code + suffix）让文件名独立做
+      <code> 高亮；i18n 三段 key 与 zh-CN.json / en-US.json 对齐。
+    -->
+    <div class="mt-7 rounded-xl border bg-muted/40 px-4 py-3">
+      <p class="text-xs leading-relaxed text-muted-foreground">
+        <span class="font-medium text-foreground">{{ t('login.firstTimeHint') }}</span>
+        <span>{{ t('login.firstTimeBodyPrefix') }}</span>
+        <code class="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px] text-foreground">
+          {{ t('login.firstTimeFile') }}
         </code>
-        ；登录后请立即修改并妥善保管。
+        <span>{{ t('login.firstTimeBodySuffix') }}</span>
       </p>
     </div>
   </div>

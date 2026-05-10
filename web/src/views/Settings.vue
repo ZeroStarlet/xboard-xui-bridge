@@ -1,34 +1,92 @@
 <script setup lang="ts">
-// 运行参数（v0.5 视觉重构）。
+// 运行参数（v0.6 视觉重构 — shadcn-vue + i18n + 深色 + a11y）。
 //
-// 视觉策略：
-//   - 每组配置（Xboard / 3x-ui / 同步周期 / 上报开关 / 日志 / Web）独立卡片，
-//     卡片头部有图标徽章 + 标题 + 副标题——让多组配置一目了然。
-//   - 顶部"操作栏"sticky：保存按钮始终可见，不必滚到最底才能保存。
-//   - Web 字段（只读）卡片用琥珀色边框 + 内部说明，与可编辑组视觉区分。
+// 信息架构：
+//   - 顶部标题 + 操作区（刷新 / 保存）
+//   - 6 个独立 Card：Xboard / 3x-ui / 同步周期 / 上报开关 / 日志 / Web 只读
+//   - 每个 Card 头部：图标徽章 + 标题 + 副标题（描述用途）
+//   - Web 卡片用琥珀色边框 + 内部说明，与可编辑组视觉区分
 //
-// 可访问性约定（v0.5 严格化）：
-//   - 所有 input 必须带 id，配套 label 必须带 for——让屏幕阅读器能朗读
-//     字段名，让用户点击 label 文字也能聚焦输入框。id 命名约定 s-<group>-<field>，
-//     防止与其它页面的同名 id 冲突。
-//   - 装饰性 SVG 一律 aria-hidden="true"——文字标签已经表达语义，图标
-//     在辅助技术树里被屏蔽即可。
-//   - 原生 checkbox 用 `accent-brand-500` 着色——这是 CSS accent-color 属性
-//     的 Tailwind 工具类，在所有现代浏览器都生效；旧 `text-brand-600` 仅对
-//     第三方 forms 插件渲染的伪 checkbox 有意义，原生 checkbox 上无作用。
-import { ref, onMounted, reactive } from 'vue'
-import { api, ApiError, type Settings, type SettingsPatch } from '@/api/client'
+// 视觉迁移：
+//   - .input → Input + Label
+//   - .cb → Switch（reporting toggles）/ Checkbox（skip_tls_verify）
+//   - .alert-error / .alert-success → toast 非阻塞通知
+//   - .label / .help-text → Label + 内嵌 muted-foreground 段落
+//   - <select> → shadcn-vue Select（仅 log level）
+//
+// dirty diff patch 逻辑保留（避免重写整个 settings 表）：computePatch 比较
+// form 与 original，仅把改动字段放入 PATCH 请求体。
+//
+// i18n：所有 settings.* / common.* / errors.* 文案走 t()。
+import { ref, computed, onMounted, reactive } from 'vue'
+import { useI18n } from 'vue-i18n'
+import {
+  Loader2,
+  RefreshCw,
+  Save,
+  Globe,
+  Server,
+  Timer,
+  Activity,
+  FileText,
+  Lock,
+} from 'lucide-vue-next'
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Checkbox } from '@/components/ui/checkbox'
+import { Switch } from '@/components/ui/switch'
+import {
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from '@/components/ui/select'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { useToast } from '@/composables/useToast'
+import { api, type Settings, type SettingsPatch } from '@/api/client'
+
+const { t } = useI18n()
+const { toast } = useToast()
 
 const loading = ref(true)
 const submitting = ref(false)
-const errMsg = ref('')
-const okMsg = ref('')
 
 const original = ref<Settings | null>(null)
+
+// canSave 派生：仅在配置已加载、不在保存中、不在刷新中时允许保存。
+//
+// 修复 v0.6 初版的交互 bug（批次 10 Codex 第 1 轮指出）：
+//   - 初始加载中：original=null，computePatch 返回 {} → 点击 Save 会看到
+//     误导的"无改动" toast；
+//   - 加载失败：同 above，且用户输入也无意义；
+//   - 加载慢期间用户输入：refresh() 完成时 Object.assign() 把 form 覆盖，
+//     用户改动丢失。
+//
+// 现在禁用按钮 + 输入框（disabled）让用户清楚"加载未完成不能编辑"，体验
+// 与传统表单加载一致。同时 submitting 期间也禁用——避免用户在 patchSettings
+// 请求飞行中继续修改字段，等请求成功后的 refresh() 把新输入覆盖掉
+// （批次 10 Codex 第 2 轮指出的"保存中输入丢失"场景）。
+//
+// canEdit 与 canSave 当前条件等价（!loading && !submitting && original 已加载），
+// 保留两个名字纯为可读性：模板 fieldset :disabled="!canEdit" 表达"能否编辑"，
+// 顶部 Save 按钮 :disabled="!canSave" 表达"能否点击保存"，语义不同但
+// 当前判定逻辑相同。
+const canEdit = computed(() =>
+  !loading.value && !submitting.value && original.value !== null,
+)
+const canSave = canEdit
 const form = reactive({
   log: { level: 'info', file: '', max_size_mb: 0, max_backups: 0, max_age_days: 0 },
   xboard: { api_host: '', token: '', timeout_sec: 15, skip_tls_verify: false, user_agent: '' },
-  // xui form：v0.4 起仅 cookie 登录模式，固定字段集（无 auth_mode / api_token）。
   xui: {
     api_host: '',
     base_path: '',
@@ -45,7 +103,6 @@ const form = reactive({
 
 async function refresh() {
   loading.value = true
-  errMsg.value = ''
   try {
     const s = await api.getSettings()
     original.value = s
@@ -56,8 +113,8 @@ async function refresh() {
     Object.assign(form.reporting, s.reporting)
     Object.assign(form.web, s.web)
   } catch (e) {
-    errMsg.value = '加载配置失败'
-    console.warn(e)
+    void e
+    toast({ title: t('settings.errLoadFailed'), variant: 'destructive' })
   } finally {
     loading.value = false
   }
@@ -65,6 +122,7 @@ async function refresh() {
 
 // 计算 patch：仅当字段值与 original 不同时才放入 patch 中。
 // 避免把"当前值"全量重写到 store，减少 reload 触发面。
+// 与 v0.5 实现完全一致——只是把错误显示从内嵌 alert 改为 toast。
 function computePatch(): SettingsPatch {
   if (!original.value) return {}
   const patch: SettingsPatch = {}
@@ -84,20 +142,19 @@ function computePatch(): SettingsPatch {
 }
 
 async function submit() {
-  errMsg.value = ''
-  okMsg.value = ''
   const patch = computePatch()
   if (Object.keys(patch).length === 0) {
-    errMsg.value = '没有需要保存的改动'
+    toast({ title: t('settings.errNoChanges'), variant: 'warning' })
     return
   }
   submitting.value = true
   try {
     await api.patchSettings(patch)
-    okMsg.value = '配置已保存并触发引擎热重载'
+    toast({ title: t('settings.okSaved'), variant: 'success' })
     await refresh()
   } catch (e) {
-    errMsg.value = e instanceof ApiError ? e.message : '保存失败'
+    void e
+    toast({ title: t('errors.saveFailed'), variant: 'destructive' })
   } finally {
     submitting.value = false
   }
@@ -111,307 +168,302 @@ onMounted(refresh)
     <!-- 页面头 -->
     <header class="mb-7 flex items-center justify-between">
       <div>
-        <h2 class="text-2xl font-semibold tracking-tight text-surface-900">运行参数</h2>
-        <p class="mt-1 text-sm text-surface-500">维护 Xboard / 3x-ui 凭据、同步周期、上报开关、日志与 Web 设置</p>
+        <h2 class="text-2xl font-semibold tracking-tight text-foreground">{{ t('settings.title') }}</h2>
+        <p class="mt-1 text-sm text-muted-foreground">{{ t('settings.subtitle') }}</p>
       </div>
       <div class="flex items-center gap-2">
-        <button class="btn-secondary" @click="refresh" :disabled="loading">
-          <svg class="h-4 w-4" :class="{ 'animate-spin': loading }" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.75" aria-hidden="true">
-            <path stroke-linecap="round" stroke-linejoin="round"
-              d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" />
-          </svg>
-          刷新
-        </button>
-        <button class="btn-primary" @click="submit" :disabled="submitting">
-          <svg
-            v-if="submitting"
-            class="h-4 w-4 animate-spin"
-            fill="none"
-            viewBox="0 0 24 24"
-            aria-hidden="true"
-          >
-            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" />
-            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-          </svg>
-          <svg v-else class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.75" aria-hidden="true">
-            <path stroke-linecap="round" stroke-linejoin="round"
-              d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
-          </svg>
-          {{ submitting ? '保存中…' : '保存' }}
-        </button>
+        <Button variant="outline" :disabled="loading" @click="refresh">
+          <Loader2 v-if="loading" class="animate-spin" aria-hidden="true" />
+          <RefreshCw v-else aria-hidden="true" />
+          {{ t('common.refresh') }}
+        </Button>
+        <Button :disabled="!canSave" :aria-busy="submitting" @click="submit">
+          <Loader2 v-if="submitting" class="animate-spin" aria-hidden="true" />
+          <Save v-else aria-hidden="true" />
+          {{ submitting ? t('common.saving') : t('common.save') }}
+        </Button>
       </div>
     </header>
 
-    <!-- 提示横幅 -->
-    <div v-if="errMsg" class="alert-error mb-5">
-      <svg class="h-5 w-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.75" aria-hidden="true">
-        <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
-      </svg>
-      <span>{{ errMsg }}</span>
-    </div>
-    <div v-if="okMsg" class="alert-success mb-5">
-      <svg class="h-5 w-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.75" aria-hidden="true">
-        <path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-      </svg>
-      <span>{{ okMsg }}</span>
-    </div>
-
-    <div class="space-y-5">
+    <!--
+      fieldset disabled 让加载未完成时所有内部 input/select/button 自动禁用——
+      原生 fieldset 行为，无需给每个控件单独传 :disabled。class="contents" 让
+      fieldset 自身不参与 flex/grid 布局（display: contents），与原 div 包裹
+      行为视觉一致。
+      用 :disabled="!canEdit" 而非 disabled 字面属性：Vue 编译时会按响应式更新。
+    -->
+    <fieldset :disabled="!canEdit" class="contents space-y-5">
+      <div class="space-y-5">
       <!-- Xboard -->
-      <section class="card">
-        <header class="section-title">
-          <span class="section-title-icon">
-            <svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.75" aria-hidden="true">
-              <path stroke-linecap="round" stroke-linejoin="round"
-                d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z M3.6 9h16.8 M3.6 15h16.8 M11.5 3a17 17 0 000 18 M12.5 3a17 17 0 010 18" />
-            </svg>
-          </span>
-          <div class="flex-1">
-            <h3 class="section-title-text">Xboard 面板对接</h3>
-            <p class="section-title-subtitle">销售面板的访问凭据（server_token + API host）</p>
+      <Card>
+        <CardHeader>
+          <div class="flex items-center gap-3">
+            <span class="flex h-9 w-9 items-center justify-center rounded-xl bg-brand-50 text-brand-600 dark:bg-brand-900/30 dark:text-brand-400" aria-hidden="true">
+              <Globe class="h-5 w-5" />
+            </span>
+            <div class="flex-1">
+              <CardTitle>{{ t('settings.xboard.title') }}</CardTitle>
+              <CardDescription>{{ t('settings.xboard.subtitle') }}</CardDescription>
+            </div>
           </div>
-        </header>
-        <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
+        </CardHeader>
+        <CardContent class="grid grid-cols-1 gap-4 md:grid-cols-2">
           <div>
-            <label class="label" for="s-xboard-api_host">api_host</label>
-            <input id="s-xboard-api_host" v-model="form.xboard.api_host" class="input" placeholder="https://panel.example.com" />
-          </div>
-          <div>
-            <label class="label" for="s-xboard-token">token (server_token)</label>
-            <input id="s-xboard-token" v-model="form.xboard.token" type="password" class="input input-mono" autocomplete="off" />
+            <Label for="s-xboard-api_host">{{ t('settings.xboard.fieldHost') }}</Label>
+            <Input id="s-xboard-api_host" v-model="form.xboard.api_host" :placeholder="t('settings.xboard.hostPlaceholder')" class="mt-1.5" />
           </div>
           <div>
-            <label class="label" for="s-xboard-timeout_sec">timeout_sec</label>
-            <input id="s-xboard-timeout_sec" v-model.number="form.xboard.timeout_sec" type="number" min="1" class="input input-mono" />
+            <Label for="s-xboard-token">{{ t('settings.xboard.fieldToken') }}</Label>
+            <Input id="s-xboard-token" v-model="form.xboard.token" type="password" autocomplete="off" class="mt-1.5 font-mono" />
           </div>
           <div>
-            <label class="label" for="s-xboard-user_agent">user_agent</label>
-            <input id="s-xboard-user_agent" v-model="form.xboard.user_agent" class="input" />
+            <Label for="s-xboard-timeout_sec">{{ t('settings.xboard.fieldTimeout') }}</Label>
+            <Input id="s-xboard-timeout_sec" v-model.number="form.xboard.timeout_sec" type="number" min="1" class="mt-1.5 font-mono" />
           </div>
-          <div class="md:col-span-2">
-            <label class="flex items-center gap-2.5 cursor-pointer" for="s-xboard-skip_tls_verify">
-              <input id="s-xboard-skip_tls_verify" v-model="form.xboard.skip_tls_verify" type="checkbox" class="cb" />
-              <span class="text-sm text-surface-700">skip_tls_verify <span class="text-xs text-surface-500">（仅自签证书内网部署可开启）</span></span>
-            </label>
+          <div>
+            <Label for="s-xboard-user_agent">{{ t('settings.xboard.fieldUserAgent') }}</Label>
+            <Input id="s-xboard-user_agent" v-model="form.xboard.user_agent" class="mt-1.5" />
           </div>
-        </div>
-      </section>
+          <div class="md:col-span-2 flex items-center gap-3">
+            <Checkbox id="s-xboard-skip_tls_verify" v-model="form.xboard.skip_tls_verify" />
+            <Label for="s-xboard-skip_tls_verify" class="cursor-pointer">
+              {{ t('settings.xboard.skipTlsLabel') }}
+              <span class="text-xs font-normal text-muted-foreground">{{ t('settings.xboard.skipTlsHelp') }}</span>
+            </Label>
+          </div>
+        </CardContent>
+      </Card>
 
       <!-- 3x-ui -->
-      <section class="card">
-        <header class="section-title">
-          <span class="section-title-icon">
-            <svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.75" aria-hidden="true">
-              <path stroke-linecap="round" stroke-linejoin="round"
-                d="M9 17.25v1.007a3 3 0 01-.879 2.122L7.5 21h9l-.621-.621A3 3 0 0115 18.257V17.25m6-12V15a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 013 15V5.25m18 0A2.25 2.25 0 0018.75 3H5.25A2.25 2.25 0 003 5.25m18 0V12a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 013 12V5.25" />
-            </svg>
-          </span>
-          <div class="flex-1">
-            <h3 class="section-title-text">3x-ui 面板对接</h3>
-            <p class="section-title-subtitle">节点端面板的 cookie 登录凭据（仅账号密码模式）</p>
+      <Card>
+        <CardHeader>
+          <div class="flex items-center gap-3">
+            <span class="flex h-9 w-9 items-center justify-center rounded-xl bg-brand-50 text-brand-600 dark:bg-brand-900/30 dark:text-brand-400" aria-hidden="true">
+              <Server class="h-5 w-5" />
+            </span>
+            <div class="flex-1">
+              <CardTitle>{{ t('settings.xui.title') }}</CardTitle>
+              <CardDescription>{{ t('settings.xui.subtitle') }}</CardDescription>
+            </div>
           </div>
-        </header>
-        <div class="alert-info mb-5">
-          <svg class="h-5 w-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.75" aria-hidden="true">
-            <path stroke-linecap="round" stroke-linejoin="round"
-              d="M11.25 11.25l.041-.02a.75.75 0 011.063.852l-.708 2.836a.75.75 0 001.063.853l.041-.021M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9-3.75h.008v.008H12V8.25z" />
-          </svg>
-          <span class="leading-relaxed">
-            v0.4 起仅支持账号密码登录（cookie 模式）。Bearer Token 模式已彻底移除——若你从 v0.2/v0.3 升级，旧的
-            <code class="rounded bg-white/60 px-1.5 py-0.5 font-mono text-[12px]">api_token</code>
-            设置已被忽略，请填 3x-ui 后台用户名 + 密码。
-          </span>
-        </div>
-        <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
-          <div>
-            <label class="label" for="s-xui-api_host">api_host</label>
-            <input id="s-xui-api_host" v-model="form.xui.api_host" class="input" placeholder="http://127.0.0.1:2053" />
+        </CardHeader>
+        <CardContent>
+          <Alert variant="info" role="status" class="mb-5">
+            <AlertDescription>
+              <span>{{ t('settings.xui.infoBannerPrefix') }}</span>
+              <code class="rounded bg-info-100 px-1.5 py-0.5 font-mono text-[12px] dark:bg-info-900/40">
+                {{ t('settings.xui.infoBannerCode') }}
+              </code>
+              <span>{{ t('settings.xui.infoBannerSuffix') }}</span>
+            </AlertDescription>
+          </Alert>
+          <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
+            <div>
+              <Label for="s-xui-api_host">{{ t('settings.xui.fieldHost') }}</Label>
+              <Input id="s-xui-api_host" v-model="form.xui.api_host" :placeholder="t('settings.xui.hostPlaceholder')" class="mt-1.5" />
+            </div>
+            <div>
+              <Label for="s-xui-base_path">{{ t('settings.xui.fieldBasePath') }}</Label>
+              <Input id="s-xui-base_path" v-model="form.xui.base_path" :placeholder="t('settings.xui.basePathPlaceholder')" class="mt-1.5" />
+            </div>
+            <div>
+              <Label for="s-xui-username">{{ t('settings.xui.fieldUsername') }}</Label>
+              <Input id="s-xui-username" v-model="form.xui.username" autocomplete="off" class="mt-1.5" />
+            </div>
+            <div>
+              <Label for="s-xui-password">{{ t('settings.xui.fieldPassword') }}</Label>
+              <Input id="s-xui-password" v-model="form.xui.password" type="password" autocomplete="new-password" class="mt-1.5" />
+            </div>
+            <div class="md:col-span-2">
+              <Label for="s-xui-totp_secret">
+                {{ t('settings.xui.fieldTotp') }}
+                <span class="text-xs font-normal text-muted-foreground">{{ t('settings.xui.totpHelp') }}</span>
+              </Label>
+              <Input
+                id="s-xui-totp_secret"
+                v-model="form.xui.totp_secret"
+                type="password"
+                :placeholder="t('settings.xui.totpPlaceholder')"
+                autocomplete="off"
+                class="mt-1.5 font-mono"
+              />
+              <p class="mt-1.5 text-xs text-muted-foreground">{{ t('settings.xui.totpClockHint') }}</p>
+            </div>
+            <div>
+              <Label for="s-xui-timeout_sec">{{ t('settings.xui.fieldTimeout') }}</Label>
+              <Input id="s-xui-timeout_sec" v-model.number="form.xui.timeout_sec" type="number" min="1" class="mt-1.5 font-mono" />
+            </div>
+            <div class="md:col-span-2 flex items-center gap-3">
+              <Checkbox id="s-xui-skip_tls_verify" v-model="form.xui.skip_tls_verify" />
+              <Label for="s-xui-skip_tls_verify" class="cursor-pointer">{{ t('settings.xui.skipTlsLabel') }}</Label>
+            </div>
           </div>
-          <div>
-            <label class="label" for="s-xui-base_path">base_path（webBasePath）</label>
-            <input id="s-xui-base_path" v-model="form.xui.base_path" class="input" placeholder="留空表示 /" />
-          </div>
-          <div>
-            <label class="label" for="s-xui-username">username（3x-ui 后台用户名）</label>
-            <input id="s-xui-username" v-model="form.xui.username" class="input" autocomplete="off" />
-          </div>
-          <div>
-            <label class="label" for="s-xui-password">password（3x-ui 后台密码）</label>
-            <input id="s-xui-password" v-model="form.xui.password" type="password" class="input" autocomplete="new-password" />
-          </div>
-          <div class="md:col-span-2">
-            <label class="label" for="s-xui-totp_secret">totp_secret <span class="text-xs font-normal text-surface-500">（仅 3x-ui 启用了 2FA 时填；base32 secret）</span></label>
-            <input
-              id="s-xui-totp_secret"
-              v-model="form.xui.totp_secret"
-              type="password"
-              class="input input-mono"
-              placeholder="留空 = 未启用 2FA（默认情形）"
-              autocomplete="off"
-            />
-            <p class="help-text">
-              需保证本机系统时钟与 3x-ui 主机时钟相差小于 30 秒——TOTP 算法对时钟漂移敏感（依赖 NTP 同步）。
-            </p>
-          </div>
-          <div>
-            <label class="label" for="s-xui-timeout_sec">timeout_sec</label>
-            <input id="s-xui-timeout_sec" v-model.number="form.xui.timeout_sec" type="number" min="1" class="input input-mono" />
-          </div>
-          <div class="md:col-span-2">
-            <label class="flex items-center gap-2.5 cursor-pointer" for="s-xui-skip_tls_verify">
-              <input id="s-xui-skip_tls_verify" v-model="form.xui.skip_tls_verify" type="checkbox" class="cb" />
-              <span class="text-sm text-surface-700">skip_tls_verify</span>
-            </label>
-          </div>
-        </div>
-      </section>
+        </CardContent>
+      </Card>
 
       <!-- 同步周期 -->
-      <section class="card">
-        <header class="section-title">
-          <span class="section-title-icon">
-            <svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.75" aria-hidden="true">
-              <path stroke-linecap="round" stroke-linejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" />
-            </svg>
-          </span>
-          <div class="flex-1">
-            <h3 class="section-title-text">同步周期（秒）</h3>
-            <p class="section-title-subtitle">最低 5 秒，避免对上游 API 形成压测；默认 60 秒与 Xboard 推荐一致</p>
+      <Card>
+        <CardHeader>
+          <div class="flex items-center gap-3">
+            <span class="flex h-9 w-9 items-center justify-center rounded-xl bg-brand-50 text-brand-600 dark:bg-brand-900/30 dark:text-brand-400" aria-hidden="true">
+              <Timer class="h-5 w-5" />
+            </span>
+            <div class="flex-1">
+              <CardTitle>{{ t('settings.intervals.title') }}</CardTitle>
+              <CardDescription>{{ t('settings.intervals.subtitle') }}</CardDescription>
+            </div>
           </div>
-        </header>
-        <div class="grid grid-cols-2 gap-4 md:grid-cols-4">
+        </CardHeader>
+        <CardContent class="grid grid-cols-2 gap-4 md:grid-cols-4">
           <div>
-            <label class="label" for="s-int-user_pull_sec">user_pull_sec</label>
-            <input id="s-int-user_pull_sec" v-model.number="form.intervals.user_pull_sec" type="number" min="5" class="input input-mono" />
-          </div>
-          <div>
-            <label class="label" for="s-int-traffic_push_sec">traffic_push_sec</label>
-            <input id="s-int-traffic_push_sec" v-model.number="form.intervals.traffic_push_sec" type="number" min="5" class="input input-mono" />
+            <Label for="s-int-user_pull_sec">{{ t('settings.intervals.userPull') }}</Label>
+            <Input id="s-int-user_pull_sec" v-model.number="form.intervals.user_pull_sec" type="number" min="5" class="mt-1.5 font-mono" />
           </div>
           <div>
-            <label class="label" for="s-int-alive_push_sec">alive_push_sec</label>
-            <input id="s-int-alive_push_sec" v-model.number="form.intervals.alive_push_sec" type="number" min="5" class="input input-mono" />
+            <Label for="s-int-traffic_push_sec">{{ t('settings.intervals.trafficPush') }}</Label>
+            <Input id="s-int-traffic_push_sec" v-model.number="form.intervals.traffic_push_sec" type="number" min="5" class="mt-1.5 font-mono" />
           </div>
           <div>
-            <label class="label" for="s-int-status_push_sec">status_push_sec</label>
-            <input id="s-int-status_push_sec" v-model.number="form.intervals.status_push_sec" type="number" min="5" class="input input-mono" />
+            <Label for="s-int-alive_push_sec">{{ t('settings.intervals.alivePush') }}</Label>
+            <Input id="s-int-alive_push_sec" v-model.number="form.intervals.alive_push_sec" type="number" min="5" class="mt-1.5 font-mono" />
           </div>
-        </div>
-      </section>
+          <div>
+            <Label for="s-int-status_push_sec">{{ t('settings.intervals.statusPush') }}</Label>
+            <Input id="s-int-status_push_sec" v-model.number="form.intervals.status_push_sec" type="number" min="5" class="mt-1.5 font-mono" />
+          </div>
+        </CardContent>
+      </Card>
 
       <!-- 上报开关 -->
-      <section class="card">
-        <header class="section-title">
-          <span class="section-title-icon">
-            <svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.75" aria-hidden="true">
-              <path stroke-linecap="round" stroke-linejoin="round"
-                d="M9.348 14.652a3.75 3.75 0 010-5.304m5.304 0a3.75 3.75 0 010 5.304m-7.425 2.121a6.75 6.75 0 010-9.546m9.546 0a6.75 6.75 0 010 9.546M5.106 18.894c-3.808-3.807-3.808-9.98 0-13.788m13.788 0c3.808 3.807 3.808 9.98 0 13.788M12 12h.008v.008H12V12zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z" />
-            </svg>
-          </span>
-          <div class="flex-1">
-            <h3 class="section-title-text">可选上报</h3>
-            <p class="section-title-subtitle">在线 IP / 节点负载——按需启用</p>
+      <Card>
+        <CardHeader>
+          <div class="flex items-center gap-3">
+            <span class="flex h-9 w-9 items-center justify-center rounded-xl bg-brand-50 text-brand-600 dark:bg-brand-900/30 dark:text-brand-400" aria-hidden="true">
+              <Activity class="h-5 w-5" />
+            </span>
+            <div class="flex-1">
+              <CardTitle>{{ t('settings.reporting.title') }}</CardTitle>
+              <CardDescription>{{ t('settings.reporting.subtitle') }}</CardDescription>
+            </div>
           </div>
-        </header>
-        <div class="space-y-3">
-          <label class="flex items-start gap-2.5 cursor-pointer rounded-xl border border-surface-200 p-4 hover:border-surface-300 transition-colors" for="s-rep-alive_enabled">
-            <input id="s-rep-alive_enabled" v-model="form.reporting.alive_enabled" type="checkbox" class="cb mt-0.5" />
+        </CardHeader>
+        <CardContent class="space-y-3">
+          <!-- alive 上报：用 Switch 而非 Checkbox 表达"立即生效"语义 -->
+          <div class="flex items-start justify-between gap-4 rounded-xl border p-4">
             <div class="flex-1">
-              <p class="text-sm font-medium text-surface-800">在线 IP 上报</p>
-              <p class="mt-0.5 text-xs text-surface-500">用于 Xboard 设备数限制；逐 email 串行调用 3x-ui，inbound 内在线用户多时延迟显著（限并发 8 路）。</p>
+              <Label for="s-rep-alive_enabled" class="cursor-pointer text-sm font-medium text-foreground">
+                {{ t('settings.reporting.aliveTitle') }}
+              </Label>
+              <p class="mt-0.5 text-xs text-muted-foreground">{{ t('settings.reporting.aliveDesc') }}</p>
             </div>
-          </label>
-          <label class="flex items-start gap-2.5 cursor-pointer rounded-xl border border-surface-200 p-4 hover:border-surface-300 transition-colors" for="s-rep-status_enabled">
-            <input id="s-rep-status_enabled" v-model="form.reporting.status_enabled" type="checkbox" class="cb mt-0.5" />
+            <Switch id="s-rep-alive_enabled" v-model="form.reporting.alive_enabled" />
+          </div>
+          <div class="flex items-start justify-between gap-4 rounded-xl border p-4">
             <div class="flex-1">
-              <p class="text-sm font-medium text-surface-800">节点 CPU / 内存 / 磁盘上报</p>
-              <p class="mt-0.5 text-xs text-surface-500">从 3x-ui server/status 拉取节点负载；仅刷新 Xboard 后台的负载条，与节点在线状态判定无关。</p>
+              <Label for="s-rep-status_enabled" class="cursor-pointer text-sm font-medium text-foreground">
+                {{ t('settings.reporting.statusTitle') }}
+              </Label>
+              <p class="mt-0.5 text-xs text-muted-foreground">{{ t('settings.reporting.statusDesc') }}</p>
             </div>
-          </label>
-        </div>
-      </section>
+            <Switch id="s-rep-status_enabled" v-model="form.reporting.status_enabled" />
+          </div>
+        </CardContent>
+      </Card>
 
       <!-- 日志 -->
-      <section class="card">
-        <header class="section-title">
-          <span class="section-title-icon">
-            <svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.75" aria-hidden="true">
-              <path stroke-linecap="round" stroke-linejoin="round"
-                d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
-            </svg>
-          </span>
-          <div class="flex-1">
-            <h3 class="section-title-text">日志</h3>
-            <p class="section-title-subtitle">level 支持热重载；file / max_size / max_backups / max_age_days 重启生效</p>
+      <Card>
+        <CardHeader>
+          <div class="flex items-center gap-3">
+            <span class="flex h-9 w-9 items-center justify-center rounded-xl bg-brand-50 text-brand-600 dark:bg-brand-900/30 dark:text-brand-400" aria-hidden="true">
+              <FileText class="h-5 w-5" />
+            </span>
+            <div class="flex-1">
+              <CardTitle>{{ t('settings.log.title') }}</CardTitle>
+              <CardDescription>{{ t('settings.log.subtitle') }}</CardDescription>
+            </div>
           </div>
-        </header>
-        <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
+        </CardHeader>
+        <CardContent class="grid grid-cols-1 gap-4 md:grid-cols-2">
           <div>
-            <label class="label" for="s-log-level">level</label>
-            <select id="s-log-level" v-model="form.log.level" class="input">
-              <option value="debug">debug</option>
-              <option value="info">info</option>
-              <option value="warn">warn</option>
-              <option value="error">error</option>
-            </select>
-          </div>
-          <div>
-            <label class="label" for="s-log-file">file（留空 = stdout）</label>
-            <input id="s-log-file" v-model="form.log.file" class="input input-mono" placeholder="例如 ./data/logs/bridge.log" />
-          </div>
-          <div>
-            <label class="label" for="s-log-max_size_mb">max_size_mb</label>
-            <input id="s-log-max_size_mb" v-model.number="form.log.max_size_mb" type="number" min="0" class="input input-mono" />
+            <Label for="s-log-level">{{ t('settings.log.fieldLevel') }}</Label>
+            <Select v-model="form.log.level">
+              <SelectTrigger id="s-log-level" class="mt-1.5">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="debug">debug</SelectItem>
+                <SelectItem value="info">info</SelectItem>
+                <SelectItem value="warn">warn</SelectItem>
+                <SelectItem value="error">error</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
           <div>
-            <label class="label" for="s-log-max_backups">max_backups</label>
-            <input id="s-log-max_backups" v-model.number="form.log.max_backups" type="number" min="0" class="input input-mono" />
+            <Label for="s-log-file">
+              {{ t('settings.log.fieldFile') }}
+              <span class="text-xs font-normal text-muted-foreground">{{ t('settings.log.fieldFileHelp') }}</span>
+            </Label>
+            <Input id="s-log-file" v-model="form.log.file" :placeholder="t('settings.log.filePlaceholder')" class="mt-1.5 font-mono" />
           </div>
           <div>
-            <label class="label" for="s-log-max_age_days">max_age_days</label>
-            <input id="s-log-max_age_days" v-model.number="form.log.max_age_days" type="number" min="0" class="input input-mono" />
+            <Label for="s-log-max_size_mb">{{ t('settings.log.fieldMaxSize') }}</Label>
+            <Input id="s-log-max_size_mb" v-model.number="form.log.max_size_mb" type="number" min="0" class="mt-1.5 font-mono" />
           </div>
-        </div>
-      </section>
+          <div>
+            <Label for="s-log-max_backups">{{ t('settings.log.fieldMaxBackups') }}</Label>
+            <Input id="s-log-max_backups" v-model.number="form.log.max_backups" type="number" min="0" class="mt-1.5 font-mono" />
+          </div>
+          <div>
+            <Label for="s-log-max_age_days">{{ t('settings.log.fieldMaxAge') }}</Label>
+            <Input id="s-log-max_age_days" v-model.number="form.log.max_age_days" type="number" min="0" class="mt-1.5 font-mono" />
+          </div>
+        </CardContent>
+      </Card>
 
       <!-- Web（只读） -->
-      <section class="card border-amber-200 bg-amber-50/30">
-        <header class="section-title">
-          <span class="flex h-9 w-9 items-center justify-center rounded-xl bg-amber-100 text-amber-700">
-            <svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.75" aria-hidden="true">
-              <path stroke-linecap="round" stroke-linejoin="round"
-                d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z" />
-            </svg>
-          </span>
-          <div class="flex-1">
-            <h3 class="section-title-text">Web 面板（重启生效）</h3>
-            <p class="section-title-subtitle text-amber-700">
-              以下字段在运行期不可修改——它们在进程启动时被消费一次。
-            </p>
+      <Card class="border-amber-200 bg-amber-50/30 dark:border-amber-800 dark:bg-amber-950/20">
+        <CardHeader>
+          <div class="flex items-center gap-3">
+            <span class="flex h-9 w-9 items-center justify-center rounded-xl bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400" aria-hidden="true">
+              <Lock class="h-5 w-5" />
+            </span>
+            <div class="flex-1">
+              <CardTitle>{{ t('settings.web.title') }}</CardTitle>
+              <CardDescription class="text-amber-700 dark:text-amber-400">{{ t('settings.web.subtitle') }}</CardDescription>
+            </div>
           </div>
-        </header>
-        <p class="mb-4 rounded-xl border border-amber-200 bg-white/60 p-3 text-xs leading-relaxed text-amber-800">
-          要改 listen_addr，最简单的方式是
-          <code class="rounded bg-amber-100 px-1.5 py-0.5 font-mono">xui-bridge change-listen-addr</code>
-          （写 systemd drop-in override + 重启）；其它启动期字段需用
-          <code class="rounded bg-amber-100 px-1.5 py-0.5 font-mono">sqlite3 ./data/bridge.db</code>
-          直接编辑 settings 表后重启进程。
-        </p>
-        <div class="grid grid-cols-1 gap-4 md:grid-cols-3">
-          <div>
-            <label class="label" for="s-web-listen_addr">listen_addr</label>
-            <input id="s-web-listen_addr" :value="form.web.listen_addr" class="input input-mono" disabled />
+        </CardHeader>
+        <CardContent>
+          <Alert variant="warning" role="status" class="mb-5">
+            <AlertDescription>
+              <span>{{ t('settings.web.tipPrefix') }}</span>
+              <code class="rounded bg-amber-100 px-1.5 py-0.5 font-mono dark:bg-amber-900/40">
+                {{ t('settings.web.tipCmdChange') }}
+              </code>
+              <span>{{ t('settings.web.tipMid') }}</span>
+              <code class="rounded bg-amber-100 px-1.5 py-0.5 font-mono dark:bg-amber-900/40">
+                {{ t('settings.web.tipCmdSqlite') }}
+              </code>
+              <span>{{ t('settings.web.tipSuffix') }}</span>
+            </AlertDescription>
+          </Alert>
+          <div class="grid grid-cols-1 gap-4 md:grid-cols-3">
+            <div>
+              <Label for="s-web-listen_addr">{{ t('settings.web.fieldListenAddr') }}</Label>
+              <Input id="s-web-listen_addr" :model-value="form.web.listen_addr" disabled class="mt-1.5 font-mono" />
+            </div>
+            <div>
+              <Label for="s-web-session_max_age_hours">{{ t('settings.web.fieldSessionMaxAge') }}</Label>
+              <Input id="s-web-session_max_age_hours" :model-value="form.web.session_max_age_hours" disabled class="mt-1.5 font-mono" />
+            </div>
+            <div>
+              <Label for="s-web-absolute_max_lifetime_hours">{{ t('settings.web.fieldAbsoluteMax') }}</Label>
+              <Input id="s-web-absolute_max_lifetime_hours" :model-value="form.web.absolute_max_lifetime_hours" disabled class="mt-1.5 font-mono" />
+            </div>
           </div>
-          <div>
-            <label class="label" for="s-web-session_max_age_hours">session_max_age_hours</label>
-            <input id="s-web-session_max_age_hours" :value="form.web.session_max_age_hours" class="input input-mono" disabled />
-          </div>
-          <div>
-            <label class="label" for="s-web-absolute_max_lifetime_hours">absolute_max_lifetime_hours</label>
-            <input id="s-web-absolute_max_lifetime_hours" :value="form.web.absolute_max_lifetime_hours" class="input input-mono" disabled />
-          </div>
-        </div>
-      </section>
-    </div>
+        </CardContent>
+      </Card>
+      </div>
+    </fieldset>
   </div>
 </template>

@@ -1,31 +1,83 @@
 <script setup lang="ts">
-// 桥接管理（v0.5 视觉重构）。
+// 桥接管理（v0.6 视觉重构 — shadcn-vue + i18n + 深色 + a11y）。
 //
 // 视觉策略：
-//   - 列表用 .data-table（与仪表盘一致）。
-//   - 表单用"右侧抽屉"而非居中模态——抽屉滑入更现代化，且让用户能边看
-//     列表边填表单（一些字段可能要参考已有桥接）。
-//   - 删除按钮放进每行尾部的工具按钮组里，带图标。
-//   - 空状态卡片化（与 Dashboard 一致），统一 UX 语言。
+//   - 列表用 shadcn-vue Table 家族
+//   - 表单用 Sheet（右侧抽屉）替代 v0.5 的自实现 transition——reka-ui 已处理
+//     focus trap / esc 关闭 / 焦点归还，无需手写 watch + nextTick
+//   - 删除确认用 Dialog 替代 native confirm()——风格统一、可定制、深色友好
+//   - 反馈用 toast 替代 inline alert——非阻塞通知
+//   - 表单字段 Input + Label + Select + Switch
 //
-// 可访问性：抽屉打开时
-//   a) 监听 Escape 键关闭——比"必须点击 X 按钮或背景"更顺手；
-//   b) nextTick 后聚焦"名称"输入框——让用户立即开始输入而无需手动点；
-//   c) 关闭后焦点归还到触发它的按钮（"新增桥接"或某行的"编辑"按钮）。
-//   不实现完整 focus trap：v0.5 范围内 esc + autofocus 已覆盖 90% 场景。
-import { ref, onMounted, computed, nextTick, watch } from 'vue'
-import { api, ApiError, type Bridge } from '@/api/client'
+// i18n：所有文案走 t()，包括 placeholder / aria-label / 错误提示 / toast 文字。
+//
+// 可访问性：
+//   - Sheet 自带 focus trap + esc 关闭 + 焦点归还（reka-ui DialogContent 内建）
+//   - Dialog 自带相同 focus 管理
+//   - 表格行操作按钮带 aria-label="编辑 {name}" / "删除 {name}"
+//   - 表单错误用 Alert role="alert" 朗读
+import { ref, onMounted, computed } from 'vue'
+import { useI18n } from 'vue-i18n'
+import { Plus, Pencil, Trash2, Loader2, AlertCircle } from 'lucide-vue-next'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Badge } from '@/components/ui/badge'
+import { Card, CardContent } from '@/components/ui/card'
+import {
+  Table,
+  TableHeader,
+  TableBody,
+  TableRow,
+  TableHead,
+  TableCell,
+} from '@/components/ui/table'
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+  SheetDescription,
+  SheetFooter,
+} from '@/components/ui/sheet'
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from '@/components/ui/dialog'
+import {
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from '@/components/ui/select'
+import { Switch } from '@/components/ui/switch'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { useToast } from '@/composables/useToast'
+import { api, type Bridge } from '@/api/client'
 
-const protocols = ['vless', 'vmess', 'trojan', 'shadowsocks', 'hysteria', 'hysteria2']
+const { t } = useI18n()
+const { toast } = useToast()
+
+const protocols = ['vless', 'vmess', 'trojan', 'shadowsocks', 'hysteria', 'hysteria2'] as const
+
+// reka-ui 的 SelectItem 禁止 value=""——空字符串被保留作"清空选择"语义。
+// 用非空 sentinel "__auto__" 表达"留空 = 按 protocol 推断"，提交时通过
+// computed selectXboardType 转换回真实空串发给后端。
+const AUTO_SENTINEL = '__auto__'
 
 const bridges = ref<Bridge[]>([])
 const loading = ref(true)
-const errMsg = ref('')
-const okMsg = ref('')
 
-// 表单状态：show=false 隐藏；editing=null 表示新增。
-const show = ref(false)
-const editing = ref<string | null>(null)
+// 抽屉表单状态
+const drawerOpen = ref(false)
+const editingName = ref<string | null>(null)
+const formError = ref('')
+const submitting = ref(false)
 const form = ref({
   name: '',
   xboard_node_id: 0,
@@ -35,61 +87,42 @@ const form = ref({
   flow: '',
   enable: true,
 })
-const submitting = ref(false)
 
-// 抽屉根容器 ref + 上次触发抽屉打开的元素（用于关闭时焦点归还）。
-const drawerRoot = ref<HTMLElement | null>(null)
-let lastTrigger: HTMLElement | null = null
+// 删除确认 Dialog 状态
+const deleteOpen = ref(false)
+const deletingBridge = ref<Bridge | null>(null)
 
-// 监听 show：true 时 nextTick 聚焦名称输入框；false 时归还焦点。
-watch(show, async (val) => {
-  if (val) {
-    await nextTick()
-    // 优先让名称输入框拿焦点；编辑模式下名称只读，那就退化到 xboard_node_id。
-    const target =
-      drawerRoot.value?.querySelector<HTMLElement>('#bridge-name:not([disabled])') ??
-      drawerRoot.value?.querySelector<HTMLElement>('#bridge-xboard-id') ??
-      null
-    target?.focus()
-  } else if (lastTrigger) {
-    // 关闭后归还焦点；用 setTimeout 让 transition 完成后再 focus，
-    // 否则 transition 元素移除会立刻把焦点转到 body。
-    const t = lastTrigger
-    lastTrigger = null
-    setTimeout(() => t.focus(), 50)
-  }
+const drawerTitle = computed(() =>
+  editingName.value ? t('bridges.editTitle', { name: editingName.value }) : t('bridges.addTitle'),
+)
+
+// xboard_node_type 在 form 内是真实值（''=auto，'vless'/'vmess' 等=指定协议）；
+// 在 Select 控件层面用 AUTO_SENTINEL 替代 '' 兼容 reka-ui 限制。两者通过
+// computed get/set 透明桥接，业务代码（submit）仍读 form.xboard_node_type
+// 的真实值，无需感知 sentinel。
+const selectXboardType = computed({
+  get(): string {
+    return form.value.xboard_node_type === '' ? AUTO_SENTINEL : form.value.xboard_node_type
+  },
+  set(v: string) {
+    form.value.xboard_node_type = v === AUTO_SENTINEL ? '' : v
+  },
 })
-
-function captureTrigger(e: Event) {
-  // currentTarget 是绑定监听的元素本身；如果是 RouterLink 等组件被原生
-  // event handler 截到 target 可能是子元素，这里用 currentTarget 拿稳定值。
-  const t = e.currentTarget as HTMLElement | null
-  if (t) lastTrigger = t
-}
-
-function onEscapeKey(e: KeyboardEvent) {
-  if (e.key === 'Escape' && show.value) {
-    show.value = false
-  }
-}
-
-const formTitle = computed(() => (editing.value ? `编辑 ${editing.value}` : '新增桥接'))
 
 async function refresh() {
   loading.value = true
-  errMsg.value = ''
   try {
     bridges.value = await api.listBridges()
   } catch (e) {
-    errMsg.value = '加载桥接列表失败'
     console.warn(e)
+    toast({ title: t('errors.loadFailed'), variant: 'destructive' })
   } finally {
     loading.value = false
   }
 }
 
 function openCreate() {
-  editing.value = null
+  editingName.value = null
   form.value = {
     name: '',
     xboard_node_id: 0,
@@ -99,13 +132,12 @@ function openCreate() {
     flow: '',
     enable: true,
   }
-  show.value = true
-  okMsg.value = ''
-  errMsg.value = ''
+  formError.value = ''
+  drawerOpen.value = true
 }
 
 function openEdit(b: Bridge) {
-  editing.value = b.name
+  editingName.value = b.name
   form.value = {
     name: b.name,
     xboard_node_id: b.xboard_node_id,
@@ -115,52 +147,66 @@ function openEdit(b: Bridge) {
     flow: b.flow ?? '',
     enable: b.enable,
   }
-  show.value = true
-  okMsg.value = ''
-  errMsg.value = ''
+  formError.value = ''
+  drawerOpen.value = true
 }
 
 async function submit() {
-  errMsg.value = ''
-  okMsg.value = ''
+  formError.value = ''
   if (!form.value.name) {
-    errMsg.value = '名称不可为空'
+    formError.value = t('bridges.errNameEmpty')
     return
   }
   if (form.value.xboard_node_id <= 0 || form.value.xui_inbound_id <= 0) {
-    errMsg.value = 'Xboard 节点 ID 与 3x-ui inbound ID 必须为正整数'
+    formError.value = t('bridges.errIdsInvalid')
     return
   }
   submitting.value = true
   try {
-    if (editing.value) {
-      await api.updateBridge(editing.value, form.value)
-      okMsg.value = '已更新并触发引擎重载'
+    if (editingName.value) {
+      await api.updateBridge(editingName.value, form.value)
+      toast({ title: t('bridges.okUpdated'), variant: 'success' })
     } else {
       await api.createBridge(form.value)
-      okMsg.value = '已创建并触发引擎重载'
+      toast({ title: t('bridges.okCreated'), variant: 'success' })
     }
-    show.value = false
+    drawerOpen.value = false
     await refresh()
   } catch (e) {
-    if (e instanceof ApiError) {
-      errMsg.value = e.message
-    } else {
-      errMsg.value = '请求失败'
-    }
+    // 错误信息走 t() 统一 i18n，与 Login.vue 同策略——损失服务端具体错误码
+    // 反馈但保 i18n 一致性。后续可按 e.code 映射到 i18n key 取回细颗粒度。
+    void e
+    formError.value = t('errors.requestFailed')
   } finally {
     submitting.value = false
   }
 }
 
-async function remove(b: Bridge) {
-  if (!confirm(`确认删除桥接 "${b.name}"？此操作不可撤销。`)) return
+function askDelete(b: Bridge) {
+  deletingBridge.value = b
+  deleteOpen.value = true
+}
+
+async function confirmDelete() {
+  if (!deletingBridge.value) return
+  const target = deletingBridge.value
+  deleteOpen.value = false
   try {
-    await api.deleteBridge(b.name)
-    okMsg.value = `已删除 ${b.name}`
+    await api.deleteBridge(target.name)
+    toast({
+      title: t('bridges.okDeleted', { name: target.name }),
+      variant: 'success',
+    })
     await refresh()
   } catch (e) {
-    errMsg.value = e instanceof ApiError ? e.message : '删除失败'
+    // i18n 一致：错误信息走 t() 不直显服务端原始消息（详见 submit 注释）。
+    void e
+    toast({
+      title: t('errors.deleteFailed'),
+      variant: 'destructive',
+    })
+  } finally {
+    deletingBridge.value = null
   }
 }
 
@@ -172,260 +218,220 @@ onMounted(refresh)
     <!-- 页面头 -->
     <header class="mb-7 flex items-center justify-between">
       <div>
-        <h2 class="text-2xl font-semibold tracking-tight text-surface-900">桥接管理</h2>
-        <p class="mt-1 text-sm text-surface-500">维护 Xboard 节点 ↔ 3x-ui inbound 的映射关系</p>
+        <h2 class="text-2xl font-semibold tracking-tight text-foreground">{{ t('bridges.title') }}</h2>
+        <p class="mt-1 text-sm text-muted-foreground">{{ t('bridges.subtitle') }}</p>
       </div>
-      <button class="btn-primary" @click="(e) => { captureTrigger(e); openCreate() }">
-        <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true">
-          <path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
-        </svg>
-        新增桥接
-      </button>
+      <Button @click="openCreate">
+        <Plus aria-hidden="true" />
+        {{ t('bridges.addBtn') }}
+      </Button>
     </header>
 
-    <!-- 提示横幅 -->
-    <div v-if="errMsg" class="alert-error mb-5">
-      <svg class="h-5 w-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.75" aria-hidden="true">
-        <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
-      </svg>
-      <span>{{ errMsg }}</span>
-    </div>
-    <div v-if="okMsg" class="alert-success mb-5">
-      <svg class="h-5 w-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.75" aria-hidden="true">
-        <path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-      </svg>
-      <span>{{ okMsg }}</span>
-    </div>
-
-    <!-- 主表格 -->
-    <section class="card">
-      <div v-if="!loading && bridges.length === 0" class="rounded-xl border border-dashed border-surface-300 bg-surface-50/50 px-6 py-12 text-center">
-        <svg class="mx-auto mb-3 h-10 w-10 text-surface-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
-          <path stroke-linecap="round" stroke-linejoin="round"
-            d="M13.19 8.688a4.5 4.5 0 011.242 7.244l-4.5 4.5a4.5 4.5 0 01-6.364-6.364l1.757-1.757m13.35-.622l1.757-1.757a4.5 4.5 0 00-6.364-6.364l-4.5 4.5a4.5 4.5 0 001.242 7.244" />
-        </svg>
-        <p class="text-sm font-medium text-surface-700">暂无桥接</p>
-        <p class="mt-1 text-xs text-surface-500">点击右上方"新增桥接"按钮添加第一个映射。</p>
-      </div>
-
-      <div v-else class="overflow-x-auto">
-        <table class="data-table">
-          <thead>
-            <tr>
-              <th>名称</th>
-              <th>协议</th>
-              <th>Xboard 节点</th>
-              <th>3x-ui inbound</th>
-              <th>状态</th>
-              <th class="text-right">操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="b in bridges" :key="b.name">
-              <td class="font-medium text-surface-900">{{ b.name }}</td>
-              <td>
-                <span class="font-mono text-[13px] text-surface-700">{{ b.protocol }}</span>
-                <span v-if="b.flow" class="ml-1 text-xs text-surface-500">({{ b.flow }})</span>
-              </td>
-              <td>
-                <span class="font-mono text-[13px]">{{ b.xboard_node_id }}</span>
-                <span class="ml-1 text-xs text-surface-500">({{ b.xboard_node_type }})</span>
-              </td>
-              <td><span class="font-mono text-[13px]">{{ b.xui_inbound_id }}</span></td>
-              <td>
-                <span v-if="b.enable" class="pill-success">
-                  <span class="pill-dot"></span>
-                  <span>启用</span>
-                </span>
-                <span v-else class="pill-neutral">
-                  <span class="pill-dot"></span>
-                  <span>禁用</span>
-                </span>
-              </td>
-              <td>
-                <div class="flex justify-end gap-1">
-                  <button
-                    class="btn-icon"
-                    :aria-label="`编辑 ${b.name}`"
-                    @click="(e) => { captureTrigger(e); openEdit(b) }"
-                  >
-                    <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.75" aria-hidden="true">
-                      <path stroke-linecap="round" stroke-linejoin="round"
-                        d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L10.582 16.07a4.5 4.5 0 01-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 011.13-1.897l8.932-8.931zm0 0L19.5 7.125M18 14v4.75A2.25 2.25 0 0115.75 21H5.25A2.25 2.25 0 013 18.75V8.25A2.25 2.25 0 015.25 6H10" />
-                    </svg>
-                  </button>
-                  <button
-                    class="btn-icon hover:bg-rose-50 hover:text-rose-600"
-                    :aria-label="`删除 ${b.name}`"
-                    @click="remove(b)"
-                  >
-                    <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.75" aria-hidden="true">
-                      <path stroke-linecap="round" stroke-linejoin="round"
-                        d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" />
-                    </svg>
-                  </button>
-                </div>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <!-- 抽屉式表单 -->
-    <transition
-      enter-active-class="transition-opacity duration-200"
-      enter-from-class="opacity-0"
-      enter-to-class="opacity-100"
-      leave-active-class="transition-opacity duration-200"
-      leave-from-class="opacity-100"
-      leave-to-class="opacity-0"
-    >
-      <div
-        v-if="show"
-        class="fixed inset-0 z-30 bg-surface-900/50 backdrop-blur-sm"
-        @click.self="show = false"
-        @keydown="onEscapeKey"
-        ref="drawerRoot"
-      >
-        <transition
-          enter-active-class="transition-transform duration-300 ease-out"
-          enter-from-class="translate-x-full"
-          enter-to-class="translate-x-0"
-          leave-active-class="transition-transform duration-200 ease-in"
-          leave-from-class="translate-x-0"
-          leave-to-class="translate-x-full"
+    <!-- 主表格——Card 默认已有 border/bg-card/text-card-foreground 类，无需重复 -->
+    <Card>
+      <CardContent class="p-6">
+        <div
+          v-if="!loading && bridges.length === 0"
+          class="rounded-xl border border-dashed bg-muted/30 px-6 py-12 text-center"
         >
-          <!--
-            role="region" + aria-label：抽屉 UX 模式不是真正的"模态对话框"——
-            用户边看背景列表边填表单是有意为之的工作流（参考已有桥接的字段值）。
-            v0.5 之前的草稿用过 role="dialog" + aria-modal="true"，但那要求
-            完整 focus trap 才合规；既然功能上希望背景可见可交互，把语义降为
-            region 才是真实表达。键盘体验仍由 Escape 关闭 + 进入聚焦首字段 +
-            退出归还焦点三件套保证（详见 watch(show, ...) 与 onEscapeKey）。
-          -->
-          <aside
-            v-if="show"
-            class="fixed inset-y-0 right-0 flex w-full max-w-lg flex-col bg-white shadow-float"
-            role="region"
-            :aria-label="formTitle"
-            tabindex="-1"
-          >
-            <header class="flex items-center justify-between border-b border-surface-200 px-6 py-5">
-              <div>
-                <h3 class="text-lg font-semibold text-surface-900">{{ formTitle }}</h3>
-                <p class="mt-1 text-xs text-surface-500">
-                  填写完成后将立即触发引擎热重载，无需重启进程。
-                </p>
-              </div>
-              <button class="btn-icon" type="button" aria-label="关闭" @click="show = false">
-                <svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true">
-                  <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </header>
+          <AlertCircle class="mx-auto mb-3 h-10 w-10 text-muted-foreground" aria-hidden="true" />
+          <p class="text-sm font-medium text-foreground">{{ t('bridges.emptyTitle') }}</p>
+          <p class="mt-1 text-xs text-muted-foreground">{{ t('bridges.emptyHint') }}</p>
+        </div>
 
-            <form @submit.prevent="submit" class="flex flex-1 flex-col overflow-hidden">
-              <div class="flex-1 space-y-5 overflow-y-auto px-6 py-6">
-                <div>
-                  <label class="label" for="bridge-name">名称</label>
-                  <input
-                    id="bridge-name"
-                    v-model="form.name"
-                    class="input"
-                    :disabled="!!editing"
-                    placeholder="例如 hk-vless-01"
-                  />
-                  <p v-if="editing" class="help-text">名称作为主键，编辑时不可修改。</p>
-                </div>
-                <div class="grid grid-cols-2 gap-4">
-                  <div>
-                    <label class="label" for="bridge-xboard-id">Xboard 节点 ID</label>
-                    <input
-                      id="bridge-xboard-id"
-                      v-model.number="form.xboard_node_id"
-                      type="number"
-                      min="1"
-                      class="input input-mono"
-                    />
-                  </div>
-                  <div>
-                    <label class="label" for="bridge-xboard-type">Xboard 节点类型</label>
-                    <select
-                      id="bridge-xboard-type"
-                      v-model="form.xboard_node_type"
-                      class="input"
-                    >
-                      <!-- 空 value：与后端"留空 = 按 protocol 推断"语义直通；
-                           与 protocol 字段共享 protocols 常量保持 DRY，
-                           避免两处枚举漂移。 -->
-                      <option value="">留空 — 按 protocol 推断</option>
-                      <option v-for="p in protocols" :key="p" :value="p">{{ p }}</option>
-                    </select>
-                  </div>
-                </div>
-                <div class="grid grid-cols-2 gap-4">
-                  <div>
-                    <label class="label" for="bridge-xui-id">3x-ui inbound ID</label>
-                    <input
-                      id="bridge-xui-id"
-                      v-model.number="form.xui_inbound_id"
-                      type="number"
-                      min="1"
-                      class="input input-mono"
-                    />
-                  </div>
-                  <div>
-                    <label class="label" for="bridge-protocol">协议</label>
-                    <select id="bridge-protocol" v-model="form.protocol" class="input">
-                      <option v-for="p in protocols" :key="p" :value="p">{{ p }}</option>
-                    </select>
-                  </div>
-                </div>
-                <div v-if="form.protocol === 'vless'">
-                  <label class="label" for="bridge-flow">Flow（仅 VLESS）</label>
-                  <input
-                    id="bridge-flow"
-                    v-model="form.flow"
-                    class="input input-mono"
-                    placeholder="例如 xtls-rprx-vision"
-                  />
-                </div>
-                <div>
-                  <label class="flex items-center gap-2.5 cursor-pointer" for="bridge-enable">
-                    <input id="bridge-enable" v-model="form.enable" type="checkbox" class="cb" />
-                    <span class="text-sm text-surface-700">启用此桥接</span>
-                  </label>
-                </div>
-
-                <div v-if="errMsg" class="alert-error">
-                  <svg class="h-5 w-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.75" aria-hidden="true">
-                    <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
-                  </svg>
-                  <span>{{ errMsg }}</span>
-                </div>
-              </div>
-
-              <footer class="flex items-center justify-end gap-3 border-t border-surface-200 px-6 py-4 bg-surface-50/50">
-                <button type="button" class="btn-secondary" @click="show = false">取消</button>
-                <button type="submit" class="btn-primary" :disabled="submitting">
-                  <svg
-                    v-if="submitting"
-                    class="h-4 w-4 animate-spin"
-                    fill="none"
-                    viewBox="0 0 24 24"
-                    aria-hidden="true"
+        <Table v-else>
+          <TableHeader>
+            <TableRow>
+              <TableHead>{{ t('bridges.tableName') }}</TableHead>
+              <TableHead>{{ t('bridges.tableProtocol') }}</TableHead>
+              <TableHead>{{ t('bridges.tableXboardNode') }}</TableHead>
+              <TableHead>{{ t('bridges.tableXuiInbound') }}</TableHead>
+              <TableHead>{{ t('bridges.tableState') }}</TableHead>
+              <TableHead class="text-right">{{ t('bridges.tableActions') }}</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            <TableRow v-for="b in bridges" :key="b.name">
+              <TableCell class="font-medium text-foreground">{{ b.name }}</TableCell>
+              <TableCell>
+                <span class="font-mono text-[13px]">{{ b.protocol }}</span>
+                <span v-if="b.flow" class="ml-1 text-xs text-muted-foreground">({{ b.flow }})</span>
+              </TableCell>
+              <TableCell>
+                <span class="font-mono text-[13px]">{{ b.xboard_node_id }}</span>
+                <span class="ml-1 text-xs text-muted-foreground">({{ b.xboard_node_type }})</span>
+              </TableCell>
+              <TableCell><span class="font-mono text-[13px]">{{ b.xui_inbound_id }}</span></TableCell>
+              <TableCell>
+                <Badge :variant="b.enable ? 'success' : 'secondary'">
+                  <span class="size-1.5 rounded-full bg-current" aria-hidden="true" />
+                  {{ b.enable ? t('common.enabled') : t('common.disabled') }}
+                </Badge>
+              </TableCell>
+              <TableCell>
+                <div class="flex justify-end gap-1">
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    :aria-label="t('bridges.actionEdit', { name: b.name })"
+                    @click="openEdit(b)"
                   >
-                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" />
-                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                  </svg>
-                  {{ submitting ? '提交中…' : '保存' }}
-                </button>
-              </footer>
-            </form>
-          </aside>
-        </transition>
-      </div>
-    </transition>
+                    <Pencil aria-hidden="true" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    class="hover:bg-destructive/10 hover:text-destructive"
+                    :aria-label="t('bridges.actionDelete', { name: b.name })"
+                    @click="askDelete(b)"
+                  >
+                    <Trash2 aria-hidden="true" />
+                  </Button>
+                </div>
+              </TableCell>
+            </TableRow>
+          </TableBody>
+        </Table>
+      </CardContent>
+    </Card>
+
+    <!--
+      抽屉表单（Sheet 右侧滑入）
+      reka-ui Dialog primitives 已自动处理：
+        - focus trap（焦点不能 Tab 到 sheet 外）
+        - Esc 关闭
+        - 关闭时焦点归还到触发器（v0.5 需要手写 lastTrigger ref + watch + nextTick）
+    -->
+    <Sheet v-model:open="drawerOpen">
+      <SheetContent side="right" class="flex flex-col">
+        <SheetHeader>
+          <SheetTitle>{{ drawerTitle }}</SheetTitle>
+          <SheetDescription>{{ t('bridges.drawerSubtitle') }}</SheetDescription>
+        </SheetHeader>
+
+        <form id="bridge-form" class="flex-1 space-y-5 overflow-y-auto py-6" @submit.prevent="submit">
+          <div>
+            <Label for="bridge-name">{{ t('bridges.fieldName') }}</Label>
+            <Input
+              id="bridge-name"
+              v-model="form.name"
+              :disabled="!!editingName"
+              :placeholder="t('bridges.namePlaceholder')"
+              class="mt-1.5"
+            />
+            <p v-if="editingName" class="mt-1.5 text-xs text-muted-foreground">
+              {{ t('bridges.nameLockedHint') }}
+            </p>
+          </div>
+
+          <div class="grid grid-cols-2 gap-4">
+            <div>
+              <Label for="bridge-xboard-id">{{ t('bridges.fieldXboardId') }}</Label>
+              <Input
+                id="bridge-xboard-id"
+                v-model.number="form.xboard_node_id"
+                type="number"
+                min="1"
+                class="mt-1.5 font-mono"
+              />
+            </div>
+            <div>
+              <Label for="bridge-xboard-type">{{ t('bridges.fieldXboardType') }}</Label>
+              <!--
+                v-model 绑到 selectXboardType（computed bridge）而非 form.xboard_node_type
+                直接：reka-ui 禁止 SelectItem value=""，所以 sentinel '__auto__'
+                作为"留空"的占位值，computed 在表层与业务层之间双向转换。
+              -->
+              <Select v-model="selectXboardType">
+                <SelectTrigger id="bridge-xboard-type" class="mt-1.5">
+                  <SelectValue :placeholder="t('bridges.xboardTypeAuto')" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem :value="AUTO_SENTINEL">{{ t('bridges.xboardTypeAuto') }}</SelectItem>
+                  <SelectItem v-for="p in protocols" :key="p" :value="p">{{ p }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-2 gap-4">
+            <div>
+              <Label for="bridge-xui-id">{{ t('bridges.fieldXuiId') }}</Label>
+              <Input
+                id="bridge-xui-id"
+                v-model.number="form.xui_inbound_id"
+                type="number"
+                min="1"
+                class="mt-1.5 font-mono"
+              />
+            </div>
+            <div>
+              <Label for="bridge-protocol">{{ t('bridges.fieldProtocol') }}</Label>
+              <Select v-model="form.protocol">
+                <SelectTrigger id="bridge-protocol" class="mt-1.5">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem v-for="p in protocols" :key="p" :value="p">{{ p }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+
+          <div v-if="form.protocol === 'vless'">
+            <Label for="bridge-flow">{{ t('bridges.fieldFlow') }}</Label>
+            <Input
+              id="bridge-flow"
+              v-model="form.flow"
+              :placeholder="t('bridges.flowPlaceholder')"
+              class="mt-1.5 font-mono"
+            />
+          </div>
+
+          <div class="flex items-center gap-3">
+            <Switch id="bridge-enable" v-model="form.enable" />
+            <Label for="bridge-enable" class="cursor-pointer">{{ t('bridges.fieldEnable') }}</Label>
+          </div>
+
+          <Alert v-if="formError" variant="destructive" role="alert" aria-live="assertive">
+            <AlertCircle />
+            <AlertDescription>{{ formError }}</AlertDescription>
+          </Alert>
+        </form>
+
+        <SheetFooter class="border-t pt-4">
+          <Button type="button" variant="outline" @click="drawerOpen = false">
+            {{ t('common.cancel') }}
+          </Button>
+          <Button type="submit" form="bridge-form" :disabled="submitting" :aria-busy="submitting">
+            <Loader2 v-if="submitting" class="animate-spin" aria-hidden="true" />
+            {{ submitting ? t('common.submitting') : t('common.save') }}
+          </Button>
+        </SheetFooter>
+      </SheetContent>
+    </Sheet>
+
+    <!--
+      删除确认 Dialog——替代 v0.5 的 native confirm()：
+      跨浏览器视觉一致、深色模式适配、可加图标 / 可定制按钮文字。
+    -->
+    <Dialog v-model:open="deleteOpen">
+      <DialogContent class="max-w-md">
+        <DialogHeader>
+          <DialogTitle>{{ t('common.delete') }}</DialogTitle>
+          <DialogDescription>
+            {{ deletingBridge ? t('bridges.deleteConfirm', { name: deletingBridge.name }) : '' }}
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button type="button" variant="outline" @click="deleteOpen = false">
+            {{ t('common.cancel') }}
+          </Button>
+          <Button type="button" variant="destructive" @click="confirmDelete">
+            {{ t('common.delete') }}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   </div>
 </template>
