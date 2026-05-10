@@ -3,6 +3,8 @@
 /dist/
 # 多平台交叉编译临时输出目录（脚本式产 release 包时用）
 /out/
+# 多平台交叉编译归档目录（tar.gz / SHA256SUMS.txt 临时打包，由 release 脚本产出）
+/dist-release/
 *.exe
 *.test
 *.out

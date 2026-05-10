@@ -103,6 +103,19 @@
     --ring:   163 94% 24%;           /* 与 primary 同源（focus 环用品牌色） */
 
     --radius: 0.5rem;                /* 8px——Fluent 卡片标准 */
+
+    /*
+     * --layout-stick-offset：粘性顶部累计高度（px 单位）。
+     *
+     * 当前布局：LiveStatusBar (h-12 = 48px) + Settings 顶部 Save 条
+     * (h-12 = 48px) + 14px 余量 = 110px。
+     *
+     * 提供给 JS 滚动锚点（Settings.scrollToAnchor）作为单一来源——避免
+     * 视图层硬编码 TOP_OFFSET 与实际布局漂移（v0.7 视觉重构第 2 轮
+     * Codex minor 反馈 #8）。深色 / 亮色都用同一值，所以仅在 :root
+     * 注册，不在 .dark 重写。
+     */
+    --layout-stick-offset: 110px;
   }
 
   .dark {
@@ -483,6 +496,398 @@ button:focus-visible {
       radial-gradient(ellipse at bottom left, rgba(96, 165, 250, 0.06), transparent 50%),
       hsl(var(--background));
   }
+
+  /* ============================================================
+   * v0.7 视觉重构（Bento Live Console）—— 主面板专用工具类。
+   *
+   * 设计目标：让运维一眼分清"指挥中心"与"普通后台"。三个核心视觉锚点：
+   *
+   *   1. .aurora-bg —— 主面板背景层升级版。在 mica-bg 极淡渐变之上叠加
+   *      多层 radial-gradient 与 background-position 漂移动画，形成缓慢
+   *      流动的极光视觉。周期 24s 接近"察觉不到却确实在动"——长时盯屏
+   *      不疲劳但每次扫一眼都有"活的"感觉。
+   *
+   *   2. .bento-tile / .bento-tile-hero / .glass-tile —— 三档磁贴语义。
+   *      Bento 网格不规则尺寸，但视觉档次清晰：默认磁贴承载常规数据，
+   *      hero 磁贴聚光强调单条核心指标，玻璃磁贴用于浮起的 status / cmdk
+   *      面板让背景的极光透出来。
+   *
+   *   3. .live-dot / .display-num / .protocol-chip / .sparkline-svg ——
+   *      原子可视化件。心跳点 + 大数据字体 + 协议芯片 + 折线图，
+   *      构成 Dashboard 的视觉语汇。
+   *
+   * 与 v0.6 兼容：v0.6 的 .card / .pill / .alert 类全部保留，重构期间允许
+   * Bento 与传统卡片共存——批次切换完成后再统一收敛。
+   * ============================================================ */
+
+  /* ----------------------------------------------------------------
+   * .aurora-bg：主面板极光背景层。
+   *
+   * 三层 radial-gradient（emerald / blue / violet）+ background-position
+   * 缓动漂移，模拟 macOS Sequoia / Win11 Mica 的"色彩呼吸"。深色模式下
+   * 提高 alpha 与饱和度——深底吞光，需更亮的色块才能在视觉上达到与
+   * 亮模式同等的"层次感"。
+   *
+   * 性能：background-position 走 GPU compositor 层（Chrome / Safari /
+   * Firefox 均如此），不触发 layout / paint，60fps 在低端集显稳定。
+   *
+   * 可访问性：用户开启 prefers-reduced-motion 时整体停止动画，回退到
+   * 静态渐变层（仍保留视觉层次，但不再漂移）。运维若有前庭敏感同事
+   * 这一点很重要。
+   * ---------------------------------------------------------------- */
+  .aurora-bg {
+    position: relative;
+    background:
+      radial-gradient(ellipse 60% 50% at 20% 0%, rgba(16, 185, 129, 0.10), transparent 60%),
+      radial-gradient(ellipse 60% 50% at 80% 100%, rgba(59, 130, 246, 0.08), transparent 60%),
+      radial-gradient(ellipse 50% 40% at 50% 50%, rgba(168, 85, 247, 0.05), transparent 70%),
+      hsl(var(--background));
+    background-size: 200% 200%, 200% 200%, 200% 200%;
+    animation: aurora 24s ease-in-out infinite;
+  }
+  .dark .aurora-bg {
+    background:
+      radial-gradient(ellipse 60% 50% at 20% 0%, rgba(52, 211, 153, 0.14), transparent 60%),
+      radial-gradient(ellipse 60% 50% at 80% 100%, rgba(96, 165, 250, 0.12), transparent 60%),
+      radial-gradient(ellipse 50% 40% at 50% 50%, rgba(192, 132, 252, 0.08), transparent 70%),
+      hsl(var(--background));
+    background-size: 200% 200%, 200% 200%, 200% 200%;
+    animation: aurora 24s ease-in-out infinite;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .aurora-bg, .dark .aurora-bg {
+      animation: none;
+    }
+    /* 同步停用 v0.7 新增的所有"装饰性"动画——breathe / pulse-ring /
+     * shimmer-bar / ticker。这些都是"有也好、无也行"的微动效，对
+     * 前庭敏感用户友好。.animate-* 是 Tailwind 生成的 utility class，
+     * 用属性选择器一次覆盖。
+     *
+     * fade-in / fade-in-up：v0.5 起就在用，但 v0.6 / v0.7 大量页面切换 +
+     * Login 入场 + CommandPalette 浮层都依赖它们。即便位移振幅小，
+     * prefers-reduced-motion 用户仍可能感知到不必要的"飞入"位移；
+     * 一并停用让首屏直接以最终态呈现（v0.7 第 2 轮 Codex minor 反馈 #5）。 */
+    .animate-breathe,
+    .animate-pulse-ring,
+    .animate-shimmer-bar,
+    .animate-ticker,
+    .animate-fade-in,
+    .animate-fade-in-up {
+      animation: none !important;
+    }
+  }
+
+  /* ----------------------------------------------------------------
+   * .bento-tile：基础磁贴。
+   *
+   * 与 .card 的区别：
+   *   - .card 是 v0.6 的语义卡片（白底 + soft 阴影 + 圆角 8px）；
+   *   - .bento-tile 圆角更大（16px = rounded-2xl），阴影更深（shadow-bento），
+   *     hover 时整体抬升 2px + shadow-bento-hover——更强的"物体感"。
+   *   - Bento 网格里相邻磁贴尺寸不一，更深阴影帮助每张卡的边界清晰。
+   *
+   * hover 抬升用 transform 而非 margin，避免触发相邻元素 reflow。
+   * ---------------------------------------------------------------- */
+  .bento-tile {
+    @apply relative rounded-2xl border bg-card p-5 text-card-foreground transition-all duration-200 ease-out;
+    box-shadow: theme('boxShadow.bento');
+  }
+  .bento-tile:hover {
+    transform: translateY(-2px);
+    box-shadow: theme('boxShadow.bento-hover');
+  }
+
+  /* ----------------------------------------------------------------
+   * .bento-tile-hero：聚光磁贴——Hero 数据用。
+   *
+   * 视觉策略：
+   *   - 渐变描边（border-image）让边缘有 emerald → info 的品牌色光带；
+   *   - shadow-spotlight 在外侧再叠一层品牌色光晕，整体像"舞台聚光灯
+   *     打下来的中心数据"；
+   *   - 内嵌 ::before 伪元素铺一层超低 alpha 的品牌色径向渐变，让背景
+   *     从中心向外微微亮——配合内容文字让"焦点数据"自带视觉权重。
+   *
+   * 仅在 Dashboard 第一屏的 Engine 状态卡使用，过多使用会失去"聚光"
+   * 的对比效果。
+   * ---------------------------------------------------------------- */
+  .bento-tile-hero {
+    @apply relative overflow-hidden rounded-2xl border bg-card p-6 text-card-foreground transition-all duration-200 ease-out;
+    background-image:
+      radial-gradient(ellipse at top left, rgba(16, 185, 129, 0.12), transparent 60%),
+      radial-gradient(ellipse at bottom right, rgba(59, 130, 246, 0.08), transparent 60%);
+    box-shadow: theme('boxShadow.spotlight');
+  }
+  .dark .bento-tile-hero {
+    background-image:
+      radial-gradient(ellipse at top left, rgba(52, 211, 153, 0.18), transparent 60%),
+      radial-gradient(ellipse at bottom right, rgba(96, 165, 250, 0.12), transparent 60%);
+  }
+
+  /* ----------------------------------------------------------------
+   * .glass-tile：玻璃磁贴——浮起元素用。
+   *
+   * 与 .card-glass 的区别：
+   *   - .card-glass 是登录页用的强玻璃拟态（圆角 24px、强 blur、
+   *     大投影）；视觉权重很重。
+   *   - .glass-tile 圆角 16px、blur 8px、投影柔和——给 LiveStatusBar
+   *     与 CommandPalette 浮层用，要"轻盈飘浮"而不是"重压下来"。
+   *
+   * 深色模式背景透明度调低让 aurora 极光透过来更醒目（详见 .card-glass 注释）。
+   * ---------------------------------------------------------------- */
+  .glass-tile {
+    @apply rounded-2xl border;
+    background-color: rgba(255, 255, 255, 0.65);
+    backdrop-filter: blur(12px) saturate(150%);
+    -webkit-backdrop-filter: blur(12px) saturate(150%);
+    box-shadow:
+      0 8px 24px -8px rgba(15, 23, 42, 0.18),
+      inset 0 0 0 1px rgba(255, 255, 255, 0.50);
+  }
+  .dark .glass-tile {
+    background-color: rgba(15, 23, 42, 0.55);
+    border-color: rgba(255, 255, 255, 0.08);
+    box-shadow:
+      0 8px 24px -8px rgba(0, 0, 0, 0.40),
+      theme('boxShadow.inset-glow');
+  }
+
+  /* ----------------------------------------------------------------
+   * .status-bar：顶部粘性 Live Status 条。
+   *
+   * 设计：一行高度 ~48px，跨页面常驻。结构：左侧 logo + 引擎心跳点 +
+   * 关键计数；右侧 ⌘K 入口 + 主题/语言切换 + 用户头像。
+   *
+   * sticky + top-0 + z-40：滚动主内容时保持可见；z-40 低于模态层 z-50，
+   * 让 Sheet/Dialog 打开时能盖在 status-bar 之上。
+   *
+   * 玻璃感：bg-background/80 + backdrop-blur 让 aurora 透过来——这是
+   * "Live Console"调性的关键视觉。完全不透明会显得割裂。
+   * ---------------------------------------------------------------- */
+  .status-bar {
+    @apply sticky top-0 z-40 flex h-12 items-center gap-3 border-b px-4 lg:px-6;
+    background-color: hsl(var(--background) / 0.80);
+    backdrop-filter: blur(16px) saturate(160%);
+    -webkit-backdrop-filter: blur(16px) saturate(160%);
+  }
+
+  /* ----------------------------------------------------------------
+   * .live-dot：脉动心跳点。
+   *
+   * 结构：相对定位的圆形容器，::before 与 ::after 两个伪元素分别承担
+   * "实心点"与"扩散光环"。光环走 animate-pulse-ring 在 1.8s 周期内
+   * scale 1→1.7 同步 opacity 0.7→0，模拟雷达扫描。
+   *
+   * 三种颜色态：
+   *   - .live-dot-on：emerald 绿，在线 / 运行中
+   *   - .live-dot-warn：amber 琥珀，部分降级 / 凭据未完整
+   *   - .live-dot-off：slate 灰，已停止 / 离线
+   *
+   * 仅 .live-dot-on 启用 pulse-ring 动画——离线状态本就静态。
+   * ---------------------------------------------------------------- */
+  .live-dot {
+    @apply relative inline-flex h-2 w-2 shrink-0;
+  }
+  .live-dot::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: 9999px;
+    background-color: currentColor;
+  }
+  .live-dot::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: 9999px;
+    background-color: currentColor;
+    opacity: 0.7;
+  }
+  .live-dot-on {
+    color: theme('colors.brand.500');
+  }
+  .live-dot-on::after {
+    animation: pulse-ring 1.8s cubic-bezier(0, 0, 0.2, 1) infinite;
+  }
+  .live-dot-warn {
+    color: theme('colors.amber.500');
+  }
+  .live-dot-warn::after {
+    animation: pulse-ring 1.8s cubic-bezier(0, 0, 0.2, 1) infinite;
+  }
+  .live-dot-off {
+    color: theme('colors.surface.400');
+  }
+  .live-dot-off::after {
+    /* 离线态：仅保留静态外环作为视觉占位，不触发 pulse-ring 动画
+     * 避免误导（停止状态在动 = 信息错位）。 */
+    animation: none;
+    opacity: 0.25;
+  }
+  /* 用户开启 prefers-reduced-motion 时所有 live-dot 动画停止——
+   * 仅保留静态实心点 + 半透明光环，状态语义不变。 */
+  @media (prefers-reduced-motion: reduce) {
+    .live-dot::after {
+      animation: none !important;
+    }
+  }
+
+  /* ----------------------------------------------------------------
+   * .display-num：大数据数字字体。
+   *
+   * tabular-nums 让所有阿拉伯数字等宽——KPI 数字滚动 / 切换时不会
+   * 因字宽差异而产生"扭动"视觉。tracking-tight 收紧字距让大字号
+   * 更紧凑工程化。
+   *
+   * 用 font-feature-settings 强制启用 tnum，比 font-variant-numeric
+   * 兼容性略好（老版 Edge / Safari）。
+   * ---------------------------------------------------------------- */
+  .display-num {
+    @apply font-semibold tracking-tight text-foreground;
+    font-feature-settings: 'tnum' 1, 'lnum' 1;
+  }
+
+  /* ----------------------------------------------------------------
+   * .protocol-chip：协议类型芯片（vless / vmess / trojan / shadowsocks /
+   * hysteria / hysteria2）。
+   *
+   * 设计：圆角胶囊 + 协议色 + mono 字体。每种协议视觉色固定让运维肌肉
+   * 记忆——看到紫色 chip 立刻知道是 trojan，不需要读字。色板沿用 v0.6
+   * surface 灰阶，非品牌色（避免与"已启用"的 brand 色混淆）。
+   * ---------------------------------------------------------------- */
+  .protocol-chip {
+    @apply inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 font-mono text-[11px] font-medium uppercase tracking-wider;
+  }
+  .protocol-chip-vless      { @apply bg-emerald-50  text-emerald-700  border-emerald-200  dark:bg-emerald-950/40 dark:text-emerald-300  dark:border-emerald-900; }
+  .protocol-chip-vmess      { @apply bg-blue-50     text-blue-700     border-blue-200     dark:bg-blue-950/40    dark:text-blue-300     dark:border-blue-900; }
+  .protocol-chip-trojan     { @apply bg-violet-50   text-violet-700   border-violet-200   dark:bg-violet-950/40  dark:text-violet-300   dark:border-violet-900; }
+  .protocol-chip-shadowsocks{ @apply bg-amber-50    text-amber-700    border-amber-200    dark:bg-amber-950/40   dark:text-amber-300    dark:border-amber-900; }
+  .protocol-chip-hysteria,
+  .protocol-chip-hysteria2  { @apply bg-rose-50     text-rose-700     border-rose-200     dark:bg-rose-950/40    dark:text-rose-300     dark:border-rose-900; }
+  .protocol-chip-default    { @apply bg-secondary   text-secondary-foreground border-border; }
+
+  /* ----------------------------------------------------------------
+   * .sparkline-svg：折线 SVG 容器。
+   *
+   * 设计：宽度铺满父容器 + 固定 viewBox 让 SVG 自适应缩放。stroke 颜色
+   * 通过 currentColor 继承父级 color，调用方用 text-brand-500 等
+   * utility 控制配色——一处定义，多种主题。
+   *
+   * fill 区域用 linear-gradient 渐变填充，从 stroke 颜色淡出到透明，
+   * 视觉上比纯线条更"有体积"。
+   * ---------------------------------------------------------------- */
+  .sparkline-svg {
+    width: 100%;
+    height: 100%;
+    overflow: visible;
+  }
+  .sparkline-svg .sparkline-stroke {
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    /* 拉到长 dasharray + 0 offset 让线条整体可见；将来要做"绘制中"
+     * 动画时可改为短 dash + 动画 offset 实现 stroke-dashoffset 描线。 */
+  }
+  .sparkline-svg .sparkline-fill {
+    fill: currentColor;
+    opacity: 0.10;
+  }
+
+  /* ----------------------------------------------------------------
+   * .nav-rail：折叠侧栏单态尺寸。
+   *
+   * 折叠 64px：仅图标可见，hover 时 tooltip 展示完整 label；
+   * 展开 240px：图标 + 文字 + 高亮指示器。
+   *
+   * 切换走 transition-[width]，CSS-only，无 JS 高度测量。
+   * 实际宽度由 AppNav.vue 内 :class="rail ? 'w-16' : 'w-60'" 控制，
+   * 这里仅注入过渡时长——保证开合动画一致。
+   * ---------------------------------------------------------------- */
+  .nav-rail-transition {
+    transition: width 200ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  /* ----------------------------------------------------------------
+   * 命令面板（CommandPalette / ⌘K）样式。
+   *
+   * 结构：
+   *   .cmdk-overlay   全屏遮罩（黑底 30% + blur 4px）
+   *   .cmdk-shell     居中浮层（玻璃磁贴 + 阴影 float）
+   *   .cmdk-input     大字号搜索框（无边框，内嵌图标）
+   *   .cmdk-list      结果列表区（最大高 60vh）
+   *   .cmdk-group     结果分组标题
+   *   .cmdk-item      单条结果（hover / aria-selected 高亮）
+   *   .cmdk-shortcut  快捷键 hint（kbd 风格）
+   *
+   * 视觉参考：macOS Spotlight + Linear / Notion 的 Cmd+K。
+   * 关键：搜索框够大（h-14 + text-lg）、结果项有图标 + 描述、
+   * 选中态用 brand 色 outline 而非背景填充——保持轻盈不抢戏。
+   * ---------------------------------------------------------------- */
+  .cmdk-overlay {
+    @apply fixed inset-0 z-50 flex items-start justify-center px-4 pt-[15vh];
+    background-color: rgba(2, 6, 23, 0.30);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+  }
+  .cmdk-shell {
+    @apply w-full max-w-2xl overflow-hidden rounded-2xl border;
+    background-color: hsl(var(--card) / 0.95);
+    backdrop-filter: blur(20px) saturate(160%);
+    -webkit-backdrop-filter: blur(20px) saturate(160%);
+    box-shadow: theme('boxShadow.float');
+  }
+  .cmdk-input {
+    @apply h-14 w-full border-0 bg-transparent px-12 text-base text-foreground
+           placeholder:text-muted-foreground
+           focus:outline-none focus:ring-0;
+  }
+  .cmdk-list {
+    /* listbox 容器：v0.7 视觉重构第 2 轮 Codex 反馈 #3 起改为 <ul role="listbox">
+     * 让屏幕阅读器把项目集合识别为可选项；list-none + m-0 重置 ul 默认
+     * 列表样式让外观保持原 div 形态。 */
+    @apply m-0 list-none max-h-[60vh] overflow-y-auto p-2;
+  }
+  .cmdk-group-label {
+    @apply px-2 py-1.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground;
+  }
+  .cmdk-item {
+    @apply flex cursor-pointer items-center gap-3 rounded-xl px-3 py-2.5 text-sm text-foreground transition-colors;
+  }
+  .cmdk-item[data-selected="true"],
+  .cmdk-item:hover {
+    background-color: hsl(var(--accent));
+  }
+  .cmdk-shortcut {
+    @apply ml-auto inline-flex items-center gap-1 rounded-md border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground;
+  }
+
+  /* ----------------------------------------------------------------
+   * .anchor-nav-item：Settings 锚点导航项。
+   *
+   * 步进式分组：左侧固定锚点 nav，点击滚动到右侧对应分组。当前激活
+   * 锚点用 brand 色左竖条 + 浅底高亮——与 AppNav 的 nav-item-active
+   * 视觉同源，让用户从主导航过渡到子导航无认知断点。
+   * ---------------------------------------------------------------- */
+  .anchor-nav-item {
+    @apply relative flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm text-muted-foreground transition-colors;
+  }
+  .anchor-nav-item:hover {
+    @apply bg-secondary text-foreground;
+  }
+  .anchor-nav-item-active {
+    @apply bg-brand-50 text-brand-700 dark:bg-brand-950/40 dark:text-brand-300;
+  }
+  .anchor-nav-item-active::before {
+    content: '';
+    position: absolute;
+    left: -0.5rem;
+    top: 0.625rem;
+    bottom: 0.625rem;
+    width: 3px;
+    border-radius: 9999px;
+    background: linear-gradient(180deg, theme('colors.brand.500'), theme('colors.info.500'));
+  }
 }
 
 @layer utilities {
@@ -495,6 +900,32 @@ button:focus-visible {
     position: absolute;
     white-space: nowrap;
     width: 1px;
+  }
+  /*
+   * .reveal-on-hover：按指针类型决定显示策略的"hover 揭示"工具类。
+   *
+   * 触屏（pointer: coarse —— 手机 / 平板）：永远 opacity-1，不依赖
+   * hover——触屏没有"鼠标悬停"概念，靠 hover 揭示等同于隐藏。
+   * 鼠标（pointer: fine）：默认 opacity-0，仅在父级 .group 被 hover
+   * 或内部聚焦时显示——与 v0.6 视觉风格一致（卡片整体干净，悬停才
+   * 暴露次要操作）。
+   *
+   * 修复 v0.7 第 2 轮 Codex minor 反馈 #7：原 group-hover/focus-within
+   * 的 opacity-0 默认值让触屏用户完全看不到操作按钮。pointer: fine
+   * 比 sm: 断点更精确——平板带触摸 + 鼠标的混合场景下行为正确。
+   */
+  .reveal-on-hover {
+    opacity: 1;
+  }
+  @media (pointer: fine) {
+    .reveal-on-hover {
+      opacity: 0;
+      transition: opacity 150ms ease-out;
+    }
+    .group:hover .reveal-on-hover,
+    .group:focus-within .reveal-on-hover {
+      opacity: 1;
+    }
   }
   /* 渐变文字——主标题 / Logo 用。
    * v0.6 迁移：原 from brand to accent 改为 from brand to info（color rename

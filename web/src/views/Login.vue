@@ -1,14 +1,14 @@
 <script setup lang="ts">
-// 登录页（v0.6 视觉重构 — shadcn-vue + i18n + 深色 + WCAG AA 强化）。
+// 登录页（v0.7 视觉重构 — Bento Live Console 玻璃登录卡 + Aurora 极光）。
 //
 // 视觉策略：
-//   - 玻璃拟态卡片（card-glass）—— v0.5 视觉资产保留：半透明 + 模糊背景，
-//     让 App.vue 渲染的渐变光斑透过卡片若隐若现，营造"高端"感。深色模式
-//     由 .dark .card-glass 已在 style.css 适配（透明度调低让深底光斑更醒目）。
-//   - 渐变 logo 图标——外层 div 用 CSS linear-gradient 渲染品牌色背景，
-//     内嵌 lucide-vue-next 的 Zap 图标做闪电纹饰，意指"中间件 / 桥接"。
-//     v0.5 用 SVG 内嵌 path，v0.6 改为 lucide 组件让源码更干净（path 数据
-//     不再硬编码在模板内）。
+//   - 玻璃拟态卡片（card-glass）—— v0.5/0.6 视觉资产保留：半透明 + 模糊背景。
+//     v0.7 起 App.vue 把登录页背景升级为 .aurora-bg 流动极光（取代 v0.6
+//     的多层静态光斑），玻璃卡片透出缓慢呼吸的极光——比静态背景更有
+//     "进入 Live Console 仪表"的仪式感。
+//   - 渐变 logo 图标—— v0.7 加 animate-breathe（4s 周期 0.5% scale 振幅）
+//     让 logo 有"活气"感，不再是冷冰冰的静态品牌；振幅极小，前庭敏感
+//     用户也无察觉负担（reduced-motion 下走 CSS @media 自动停用）。
 //   - 输入控件用 shadcn-vue Input + Label 组件，焦点环用 ring 语义 token，
 //     深色模式 ring-offset 跟随 background。
 //   - 按钮 loading 态用旋转 spinner（lucide Loader2），比纯文字更专业。
@@ -82,7 +82,7 @@ async function submit() {
     <div class="mb-8 flex flex-col items-center text-center">
       <!-- 渐变 logo 图标：圆角方形 + 闪电纹饰，意指"中间件 / 桥接"。
            lucide Zap 图标替代 v0.5 的内联 SVG path，源码更干净。 -->
-      <div class="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl shadow-soft"
+      <div class="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl shadow-soft animate-breathe"
            style="background: linear-gradient(135deg, #10b981, #3b82f6);">
         <Zap class="h-7 w-7 text-white" stroke-width="2" aria-hidden="true" />
       </div>

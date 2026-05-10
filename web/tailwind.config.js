@@ -141,6 +141,10 @@ export default {
           700: '#047857',
           800: '#065f46',
           900: '#064e3b',
+          // emerald-950（Tailwind 默认值）—— v0.7 视觉重构 .anchor-nav-item-active
+          // 在深色模式下需要"比 surface-950 略亮的极深翠绿"做高亮底色，
+          // 用 brand-950/40 透明叠加可在 dark mode 下与品牌色一致。
+          950: '#022c22',
           DEFAULT: '#10b981',
           dark: '#065f46',
         },
@@ -196,7 +200,11 @@ export default {
       },
 
       // ============================================================
-      // 阴影令牌（v0.5 沿用 + 重命名 glow-accent → glow-info 与色阶迁移同步）
+      // 阴影令牌
+      //
+      // v0.5：soft / float / glow / glow-info（v0.6 起 accent→info 改名）；
+      // v0.7 视觉重构追加：bento / bento-hover / spotlight / inset-glow，
+      // 服务于 Bento Live Console（不规则磁贴 + 浮起 hover + hero 聚光）。
       // ============================================================
       boxShadow: {
         // soft：默认卡片用——精致两层柔和阴影。
@@ -208,6 +216,22 @@ export default {
         // glow-info：原 glow-accent 改名（与 accent → info 迁移同步），
         // 用于次要交互的 focus 环。
         'glow-info': '0 0 0 4px rgba(59, 130, 246, 0.15)',
+
+        // bento：Bento 磁贴静态阴影。比 soft 略深一档，让磁贴在 mica/aurora
+        // 背景上"浮起"——背景层有动态光晕，卡片需要更明确的层次区分。
+        bento:
+          '0 1px 2px 0 rgba(15, 23, 42, 0.05), 0 8px 24px -8px rgba(15, 23, 42, 0.12)',
+        // bento-hover：磁贴 hover 时阴影聚焦放大。配合 translateY(-2px) 实现
+        // "向上浮起"的物理直觉。
+        'bento-hover':
+          '0 4px 8px -2px rgba(15, 23, 42, 0.10), 0 16px 32px -8px rgba(15, 23, 42, 0.18)',
+        // spotlight：Hero 磁贴聚光阴影。深色调暖底+品牌色光晕，营造"焦点
+        // 数据"的视觉权重。运维一眼就能定位"今天最重要的数字在哪"。
+        spotlight:
+          '0 0 0 1px rgba(16, 185, 129, 0.12), 0 8px 24px -4px rgba(16, 185, 129, 0.20), 0 24px 48px -16px rgba(15, 23, 42, 0.30)',
+        // inset-glow：玻璃磁贴内描边发光，强化"半透明浮层"的边缘感——
+        // 没有这层 inset，玻璃在深色背景上容易看不清边界。
+        'inset-glow': 'inset 0 0 0 1px rgba(255, 255, 255, 0.10), inset 0 1px 0 0 rgba(255, 255, 255, 0.06)',
       },
 
       // ============================================================
@@ -278,6 +302,66 @@ export default {
           from: { height: 'var(--reka-accordion-content-height)' },
           to:   { height: '0' },
         },
+
+        // ============================================================
+        // v0.7 视觉重构 keyframes（Bento Live Console）
+        //
+        // 全部走 transform / opacity / background-position 三类 GPU 友好属性，
+        // 60fps 在 Intel UHD 集显也不掉帧；不触发 layout / paint。
+        // 命名以名词为准——动画"做什么"，而不是"怎么做"。
+        // ============================================================
+
+        // aurora：极光背景层缓慢漂移。
+        //
+        //   - 用 background-position 平移 + 0/50/100% 三段 hue 漂移，
+        //     让多层 radial-gradient 看起来像在缓慢呼吸 / 流动。
+        //   - 周期 24s 故意拉长——运维盯屏数小时不能让动画"喧宾夺主"，
+        //     呼吸感要"几乎察觉不到却确实在动"。
+        //   - 仅给主面板 .aurora-bg 用，登录页保留 v0.5 静态光斑。
+        aurora: {
+          '0%':   { backgroundPosition: '0% 50%, 100% 50%, 50% 0%' },
+          '50%':  { backgroundPosition: '100% 50%, 0% 50%, 50% 100%' },
+          '100%': { backgroundPosition: '0% 50%, 100% 50%, 50% 0%' },
+        },
+
+        // breathe：磁贴或 hero 元素的呼吸缩放。
+        //
+        //   - 0.5% 振幅，肉眼几乎察觉不到形变——但视觉上让"在线 / 运行中"
+        //     的状态徽章有"活气"，区别于"已停止"的冷冰冰静态卡。
+        //   - 走 scale 不走 width / height（避免 reflow）。
+        breathe: {
+          '0%, 100%': { transform: 'scale(1)' },
+          '50%':      { transform: 'scale(1.005)' },
+        },
+
+        // pulse-ring：心跳点向外扩散光环。
+        //
+        //   - 给 LiveDot 组件用：中心实心点 + 外层 absolute 元素做光环
+        //     扩散；scale 1→1.8 同步 opacity 0.7→0，模拟雷达扫描视觉。
+        //   - 周期 1.8s，与人静息心率（~60bpm = 1s/拍）略慢——再快显得焦虑，
+        //     再慢显得无生机。
+        'pulse-ring': {
+          '0%':   { transform: 'scale(1)',   opacity: '0.7' },
+          '70%':  { transform: 'scale(1.7)', opacity: '0' },
+          '100%': { transform: 'scale(1.7)', opacity: '0' },
+        },
+
+        // ticker：数字向上滚动单元（v0.7 暂作为视觉储备，Dashboard 流量
+        // 速率展示若接入后端 metrics 即可启用；当前展示静态值 + 闪烁刷新）。
+        ticker: {
+          '0%':   { transform: 'translateY(0%)' },
+          '100%': { transform: 'translateY(-50%)' },
+        },
+
+        // shimmer-bar：横向闪光条带，用于 sparkline 占位 / 加载态。
+        //
+        //   - 与 v0.5 的 shimmer 区别：方向是 left→right（不是 -200%→200%
+        //     的循环漂移），单次播放 1.6s 后停止；放在 Skeleton 卡片或
+        //     sparkline 占位上，给"数据拉取中"一个明确视觉信号。
+        'shimmer-bar': {
+          '0%':   { transform: 'translateX(-100%)' },
+          '100%': { transform: 'translateX(100%)' },
+        },
       },
       animation: {
         'fade-in-up':     'fade-in-up 0.4s cubic-bezier(0.16, 1, 0.3, 1)',
@@ -286,6 +370,13 @@ export default {
         'pulse-soft':     'pulse-soft 2s cubic-bezier(0.4, 0, 0.6, 1) infinite',
         'accordion-down': 'accordion-down 0.2s ease-out',
         'accordion-up':   'accordion-up 0.2s ease-out',
+
+        // v0.7 视觉重构（Bento Live Console）
+        aurora:           'aurora 24s ease-in-out infinite',
+        breathe:          'breathe 4s ease-in-out infinite',
+        'pulse-ring':     'pulse-ring 1.8s cubic-bezier(0, 0, 0.2, 1) infinite',
+        ticker:           'ticker 0.6s cubic-bezier(0.16, 1, 0.3, 1)',
+        'shimmer-bar':    'shimmer-bar 1.6s ease-in-out infinite',
       },
     },
   },

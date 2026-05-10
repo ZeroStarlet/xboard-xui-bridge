@@ -1,37 +1,33 @@
 <script setup lang="ts">
-// 桥接管理（v0.6 视觉重构 — shadcn-vue + i18n + 深色 + a11y）。
+// 桥接管理（v0.7 视觉重构 — Bento Live Console）。
 //
-// 视觉策略：
-//   - 列表用 shadcn-vue Table 家族
-//   - 表单用 Sheet（右侧抽屉）替代 v0.5 的自实现 transition——reka-ui 已处理
-//     focus trap / esc 关闭 / 焦点归还，无需手写 watch + nextTick
-//   - 删除确认用 Dialog 替代 native confirm()——风格统一、可定制、深色友好
-//   - 反馈用 toast 替代 inline alert——非阻塞通知
-//   - 表单字段 Input + Label + Select + Switch
+// v0.7 与 v0.6 差异：
 //
-// i18n：所有文案走 t()，包括 placeholder / aria-label / 错误提示 / toast 文字。
+//   1. 列表样式：从 Table 改为响应式卡片网格——与 Dashboard 桥接卡片
+//      视觉同源（同一种 protocol-chip + LiveDot + IDs 布局），让"看
+//      列表" 与"看仪表盘"无认知断点。
 //
-// 可访问性：
-//   - Sheet 自带 focus trap + esc 关闭 + 焦点归还（reka-ui DialogContent 内建）
-//   - Dialog 自带相同 focus 管理
-//   - 表格行操作按钮带 aria-label="编辑 {name}" / "删除 {name}"
-//   - 表单错误用 Alert role="alert" 朗读
+//   2. 卡片操作：编辑 / 删除按钮在 group-hover 时浮现——平时视觉干净，
+//      鼠标悬停才有交互暗示，符合"工程感运维中心"调性。
+//
+//   3. 抽屉表单 / 删除确认 Dialog：保留 v0.6 实现（Sheet + Dialog 已
+//      包含完整 focus trap + ESC 关闭 + 焦点归还）。Sheet content 内部
+//      微调间距让 Bento 风更紧凑。
+//
+// 数据流：
+//
+//   - onMounted refresh()，submit / confirmDelete 后再次 refresh()。
+//     桥接列表不走 useStatus 共享 composable——它是 / 端点不同
+//     （/api/bridges vs /api/status），且仅本视图需要列表本身。
+//
+// i18n：所有 bridges.* / common.* 文案走 t()，与 v0.6 一致。
 import { ref, onMounted, computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { Plus, Pencil, Trash2, Loader2, AlertCircle } from 'lucide-vue-next'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Badge } from '@/components/ui/badge'
-import { Card, CardContent } from '@/components/ui/card'
-import {
-  Table,
-  TableHeader,
-  TableBody,
-  TableRow,
-  TableHead,
-  TableCell,
-} from '@/components/ui/table'
+import { Skeleton } from '@/components/ui/skeleton'
 import {
   Sheet,
   SheetContent,
@@ -57,6 +53,7 @@ import {
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { Alert, AlertDescription } from '@/components/ui/alert'
+import LiveDot from '@/components/LiveDot.vue'
 import { useToast } from '@/composables/useToast'
 import { api, type Bridge } from '@/api/client'
 
@@ -64,10 +61,6 @@ const { t } = useI18n()
 const { toast } = useToast()
 
 const protocols = ['vless', 'vmess', 'trojan', 'shadowsocks', 'hysteria', 'hysteria2'] as const
-
-// reka-ui 的 SelectItem 禁止 value=""——空字符串被保留作"清空选择"语义。
-// 用非空 sentinel "__auto__" 表达"留空 = 按 protocol 推断"，提交时通过
-// computed selectXboardType 转换回真实空串发给后端。
 const AUTO_SENTINEL = '__auto__'
 
 const bridges = ref<Bridge[]>([])
@@ -96,10 +89,7 @@ const drawerTitle = computed(() =>
   editingName.value ? t('bridges.editTitle', { name: editingName.value }) : t('bridges.addTitle'),
 )
 
-// xboard_node_type 在 form 内是真实值（''=auto，'vless'/'vmess' 等=指定协议）；
-// 在 Select 控件层面用 AUTO_SENTINEL 替代 '' 兼容 reka-ui 限制。两者通过
-// computed get/set 透明桥接，业务代码（submit）仍读 form.xboard_node_type
-// 的真实值，无需感知 sentinel。
+// xboard_node_type 业务层留空 ↔ Select 层 AUTO_SENTINEL 双向桥接（同 v0.6）
 const selectXboardType = computed({
   get(): string {
     return form.value.xboard_node_type === '' ? AUTO_SENTINEL : form.value.xboard_node_type
@@ -109,7 +99,7 @@ const selectXboardType = computed({
   },
 })
 
-async function refresh() {
+async function refresh(): Promise<void> {
   loading.value = true
   try {
     bridges.value = await api.listBridges()
@@ -121,7 +111,7 @@ async function refresh() {
   }
 }
 
-function openCreate() {
+function openCreate(): void {
   editingName.value = null
   form.value = {
     name: '',
@@ -136,7 +126,7 @@ function openCreate() {
   drawerOpen.value = true
 }
 
-function openEdit(b: Bridge) {
+function openEdit(b: Bridge): void {
   editingName.value = b.name
   form.value = {
     name: b.name,
@@ -151,7 +141,7 @@ function openEdit(b: Bridge) {
   drawerOpen.value = true
 }
 
-async function submit() {
+async function submit(): Promise<void> {
   formError.value = ''
   if (!form.value.name) {
     formError.value = t('bridges.errNameEmpty')
@@ -173,8 +163,6 @@ async function submit() {
     drawerOpen.value = false
     await refresh()
   } catch (e) {
-    // 错误信息走 t() 统一 i18n，与 Login.vue 同策略——损失服务端具体错误码
-    // 反馈但保 i18n 一致性。后续可按 e.code 映射到 i18n key 取回细颗粒度。
     void e
     formError.value = t('errors.requestFailed')
   } finally {
@@ -182,12 +170,12 @@ async function submit() {
   }
 }
 
-function askDelete(b: Bridge) {
+function askDelete(b: Bridge): void {
   deletingBridge.value = b
   deleteOpen.value = true
 }
 
-async function confirmDelete() {
+async function confirmDelete(): Promise<void> {
   if (!deletingBridge.value) return
   const target = deletingBridge.value
   deleteOpen.value = false
@@ -199,7 +187,6 @@ async function confirmDelete() {
     })
     await refresh()
   } catch (e) {
-    // i18n 一致：错误信息走 t() 不直显服务端原始消息（详见 submit 注释）。
     void e
     toast({
       title: t('errors.deleteFailed'),
@@ -210,16 +197,29 @@ async function confirmDelete() {
   }
 }
 
+// 协议色 helper—— 与 Dashboard 共用 .protocol-chip-* 工具类。
+function protocolChipClass(protocol: string): string {
+  const p = protocol.toLowerCase()
+  if (['vless', 'vmess', 'trojan', 'shadowsocks', 'hysteria', 'hysteria2'].includes(p)) {
+    return `protocol-chip-${p}`
+  }
+  return 'protocol-chip-default'
+}
+
 onMounted(refresh)
 </script>
 
 <template>
-  <div>
+  <div class="space-y-5">
     <!-- 页面头 -->
-    <header class="mb-7 flex items-center justify-between">
+    <header class="flex items-center justify-between">
       <div>
-        <h2 class="text-2xl font-semibold tracking-tight text-foreground">{{ t('bridges.title') }}</h2>
-        <p class="mt-1 text-sm text-muted-foreground">{{ t('bridges.subtitle') }}</p>
+        <h2 class="text-2xl font-semibold tracking-tight text-foreground">
+          {{ t('bridges.title') }}
+        </h2>
+        <p class="mt-1 text-sm text-muted-foreground">
+          {{ t('bridges.subtitle') }}
+        </p>
       </div>
       <Button @click="openCreate">
         <Plus aria-hidden="true" />
@@ -227,80 +227,113 @@ onMounted(refresh)
       </Button>
     </header>
 
-    <!-- 主表格——Card 默认已有 border/bg-card/text-card-foreground 类，无需重复 -->
-    <Card>
-      <CardContent class="p-6">
-        <div
-          v-if="!loading && bridges.length === 0"
-          class="rounded-xl border border-dashed bg-muted/30 px-6 py-12 text-center"
-        >
-          <AlertCircle class="mx-auto mb-3 h-10 w-10 text-muted-foreground" aria-hidden="true" />
-          <p class="text-sm font-medium text-foreground">{{ t('bridges.emptyTitle') }}</p>
-          <p class="mt-1 text-xs text-muted-foreground">{{ t('bridges.emptyHint') }}</p>
+    <!-- 加载占位：3 张 skeleton 卡片 -->
+    <section v-if="loading && bridges.length === 0" class="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+      <Skeleton v-for="n in 3" :key="n" class="h-32 w-full" />
+    </section>
+
+    <!-- 空态：dashed border + CTA -->
+    <section
+      v-else-if="!loading && bridges.length === 0"
+      class="bento-tile"
+    >
+      <div class="rounded-xl border border-dashed bg-muted/30 px-6 py-12 text-center">
+        <AlertCircle class="mx-auto mb-3 h-10 w-10 text-muted-foreground" aria-hidden="true" />
+        <p class="text-sm font-medium text-foreground">{{ t('bridges.emptyTitle') }}</p>
+        <p class="mt-1 text-xs text-muted-foreground">{{ t('bridges.emptyHint') }}</p>
+        <Button class="mt-4" @click="openCreate">
+          <Plus aria-hidden="true" />
+          {{ t('bridges.addBtn') }}
+        </Button>
+      </div>
+    </section>
+
+    <!-- 卡片网格 -->
+    <section v-else class="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+      <article
+        v-for="b in bridges"
+        :key="b.name"
+        class="group relative flex flex-col gap-3 rounded-2xl border bg-card p-5 shadow-bento transition-all duration-200 hover:-translate-y-0.5 hover:border-brand-300 hover:shadow-bento-hover dark:hover:border-brand-700"
+      >
+        <!-- 顶行：name + 状态 LiveDot + 操作浮按钮 -->
+        <div class="flex items-start gap-2">
+          <div class="flex-1 min-w-0">
+            <p class="truncate text-sm font-semibold text-foreground">{{ b.name }}</p>
+            <div class="mt-1.5 flex flex-wrap items-center gap-1.5">
+              <span class="protocol-chip" :class="protocolChipClass(b.protocol)">
+                {{ b.protocol }}
+              </span>
+              <span v-if="b.flow" class="font-mono text-[11px] text-muted-foreground">
+                {{ b.flow }}
+              </span>
+            </div>
+          </div>
+          <LiveDot :status="b.enable ? 'on' : 'off'" size="md" />
         </div>
 
-        <Table v-else>
-          <TableHeader>
-            <TableRow>
-              <TableHead>{{ t('bridges.tableName') }}</TableHead>
-              <TableHead>{{ t('bridges.tableProtocol') }}</TableHead>
-              <TableHead>{{ t('bridges.tableXboardNode') }}</TableHead>
-              <TableHead>{{ t('bridges.tableXuiInbound') }}</TableHead>
-              <TableHead>{{ t('bridges.tableState') }}</TableHead>
-              <TableHead class="text-right">{{ t('bridges.tableActions') }}</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            <TableRow v-for="b in bridges" :key="b.name">
-              <TableCell class="font-medium text-foreground">{{ b.name }}</TableCell>
-              <TableCell>
-                <span class="font-mono text-[13px]">{{ b.protocol }}</span>
-                <span v-if="b.flow" class="ml-1 text-xs text-muted-foreground">({{ b.flow }})</span>
-              </TableCell>
-              <TableCell>
-                <span class="font-mono text-[13px]">{{ b.xboard_node_id }}</span>
-                <span class="ml-1 text-xs text-muted-foreground">({{ b.xboard_node_type }})</span>
-              </TableCell>
-              <TableCell><span class="font-mono text-[13px]">{{ b.xui_inbound_id }}</span></TableCell>
-              <TableCell>
-                <Badge :variant="b.enable ? 'success' : 'secondary'">
-                  <span class="size-1.5 rounded-full bg-current" aria-hidden="true" />
-                  {{ b.enable ? t('common.enabled') : t('common.disabled') }}
-                </Badge>
-              </TableCell>
-              <TableCell>
-                <div class="flex justify-end gap-1">
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    :aria-label="t('bridges.actionEdit', { name: b.name })"
-                    @click="openEdit(b)"
-                  >
-                    <Pencil aria-hidden="true" />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    class="hover:bg-destructive/10 hover:text-destructive"
-                    :aria-label="t('bridges.actionDelete', { name: b.name })"
-                    @click="askDelete(b)"
-                  >
-                    <Trash2 aria-hidden="true" />
-                  </Button>
-                </div>
-              </TableCell>
-            </TableRow>
-          </TableBody>
-        </Table>
-      </CardContent>
-    </Card>
+        <!-- 中行：Xboard / 3x-ui ID 对照 -->
+        <div class="grid grid-cols-2 gap-3 text-xs">
+          <div>
+            <p class="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+              {{ t('bridges.tableXboardNode') }}
+            </p>
+            <p class="mt-0.5 font-mono text-foreground">
+              #{{ b.xboard_node_id }}
+              <span v-if="b.xboard_node_type" class="text-muted-foreground">
+                ({{ b.xboard_node_type }})
+              </span>
+            </p>
+          </div>
+          <div>
+            <p class="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+              {{ t('bridges.tableXuiInbound') }}
+            </p>
+            <p class="mt-0.5 font-mono text-foreground">#{{ b.xui_inbound_id }}</p>
+          </div>
+        </div>
+
+        <!-- 底行：状态文字 + 浮按钮（编辑 / 删除）。
+             group-hover 时浮按钮 opacity 100；focus-within 让键盘 Tab
+             导航时按钮也可见——纯 hover 隐藏会让键盘用户找不到操作。 -->
+        <div class="flex items-center justify-between border-t pt-3">
+          <span class="text-xs font-medium" :class="b.enable
+            ? 'text-brand-700 dark:text-brand-400'
+            : 'text-muted-foreground'">
+            {{ b.enable ? t('common.enabled') : t('common.disabled') }}
+          </span>
+          <!--
+            按钮揭示策略：触屏（pointer: coarse）常显，鼠标用户 hover/focus 才显示
+            （v0.7 第 2 轮 Codex minor 反馈 #7 修复）。.reveal-on-hover 工具类
+            （style.css）按 @media (pointer: fine) 区分——避免触屏用户看不到
+            编辑/删除入口。
+          -->
+          <div class="reveal-on-hover flex gap-1">
+            <Button
+              variant="ghost"
+              size="icon"
+              class="h-8 w-8"
+              :aria-label="t('bridges.actionEdit', { name: b.name })"
+              @click="openEdit(b)"
+            >
+              <Pencil class="size-4" aria-hidden="true" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              class="h-8 w-8 hover:bg-destructive/10 hover:text-destructive"
+              :aria-label="t('bridges.actionDelete', { name: b.name })"
+              @click="askDelete(b)"
+            >
+              <Trash2 class="size-4" aria-hidden="true" />
+            </Button>
+          </div>
+        </div>
+      </article>
+    </section>
 
     <!--
-      抽屉表单（Sheet 右侧滑入）
-      reka-ui Dialog primitives 已自动处理：
-        - focus trap（焦点不能 Tab 到 sheet 外）
-        - Esc 关闭
-        - 关闭时焦点归还到触发器（v0.5 需要手写 lastTrigger ref + watch + nextTick）
+      抽屉表单（Sheet 右侧滑入）—— v0.6 实现保留：reka-ui 自动处理
+      focus trap / Esc 关闭 / 焦点归还。
     -->
     <Sheet v-model:open="drawerOpen">
       <SheetContent side="right" class="flex flex-col">
@@ -337,11 +370,6 @@ onMounted(refresh)
             </div>
             <div>
               <Label for="bridge-xboard-type">{{ t('bridges.fieldXboardType') }}</Label>
-              <!--
-                v-model 绑到 selectXboardType（computed bridge）而非 form.xboard_node_type
-                直接：reka-ui 禁止 SelectItem value=""，所以 sentinel '__auto__'
-                作为"留空"的占位值，computed 在表层与业务层之间双向转换。
-              -->
               <Select v-model="selectXboardType">
                 <SelectTrigger id="bridge-xboard-type" class="mt-1.5">
                   <SelectValue :placeholder="t('bridges.xboardTypeAuto')" />
@@ -411,10 +439,7 @@ onMounted(refresh)
       </SheetContent>
     </Sheet>
 
-    <!--
-      删除确认 Dialog——替代 v0.5 的 native confirm()：
-      跨浏览器视觉一致、深色模式适配、可加图标 / 可定制按钮文字。
-    -->
+    <!-- 删除确认 Dialog—— v0.6 实现保留（reka-ui 自带 focus 管理）。 -->
     <Dialog v-model:open="deleteOpen">
       <DialogContent class="max-w-md">
         <DialogHeader>
