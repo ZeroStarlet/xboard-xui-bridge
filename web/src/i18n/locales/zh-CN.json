@@ -36,7 +36,9 @@
     "settings": "运行参数",
     "account": "账户",
     "notLoggedIn": "未登录",
-    "ariaMain": "主导航"
+    "ariaMain": "主导航",
+    "groupMain": "导航",
+    "engineLabel": "引擎"
   },
   "statusBar": {
     "aria": "顶部状态条",

@@ -36,7 +36,9 @@
     "settings": "Settings",
     "account": "Account",
     "notLoggedIn": "Not signed in",
-    "ariaMain": "Main navigation"
+    "ariaMain": "Main navigation",
+    "groupMain": "Navigate",
+    "engineLabel": "Engine"
   },
   "statusBar": {
     "aria": "Top status bar",
