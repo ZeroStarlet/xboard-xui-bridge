@@ -36,7 +36,7 @@
                   │                      │   admin_users / sessions /
                   │                      │   traffic_baseline
                   └──────────┬───────────┘
-                             │  HTTP（Bearer Token 鉴权）
+                             │  HTTP（Bearer Token / Cookie 鉴权 v0.3+）
                     ┌────────┴────────────┐
                     │   3x-ui 面板        │
                     │ /panel/api/...      │
@@ -89,7 +89,7 @@ systemctl daemon-reload
 | 系统 | 准备项 |
 | --- | --- |
 | Xboard | 在系统设置中拿到 `server_token`；为该节点分配数字 ID。 |
-| 3x-ui  | 在面板设置中生成 API Token（48 字符）；在该节点机预创建 inbound 拿到数字 ID。 |
+| 3x-ui  | 主线 v2.4+：在面板设置中生成 API Token（48 字符），运行参数选 `auth_mode = token`；fork 版本若不支持 Bearer Token（`strings $(which x-ui) \| grep -ic apitoken == 0`），改选 `auth_mode = cookie` 并填 3x-ui 后台用户名 / 密码即可。在该节点机预创建 inbound 拿到数字 ID。 |
 
 ### 2. 下载或编译
 
@@ -226,9 +226,10 @@ v0.1 通过 `config.yaml` 维护配置；v0.2 起完全废弃 yaml，迁移到 S
 - **节点协议级字段不同步**：端口、TLS、Reality 等由管理员在 3x-ui 维护；中间件只同步 client。
 - **`Push` 端点缺少 idempotency key**：Xboard `/api/v2/server/push` 当前不接受幂等键。极小概率下"push 成功但本地 baseline 写入失败"会导致单次重复计费；该窗口的概率 ≈ 本地 SQLite 单次写失败率（接近 0）。彻底消除需要 Xboard 端在协议层引入 idempotency key，超出中间件单方可控的范围。**流量丢失方向已通过 `last_seen + pending` 字段得到根除**（重置 + push 失败叠加场景下也不会丢失）。
 - **alive 上报性能**：`GetClientIPs` 是逐 email 串行接口；inbound 内在线用户多时延迟会显著（已限并发 8 路）。
-- **3x-ui 鉴权仅支持 Bearer Token**：早期版本计划支持 cookie 登录，但现代 3x-ui 对浏览器路由（含 `/login` 与 `/panel/api` 的 cookie 调用）启用 CSRF 校验，需要先 `GET /csrf-token` 再带 `X-CSRF-Token`，且 token 与 session 绑定，刷新策略复杂；权衡后统一收敛为 token 模式。请在 3x-ui 后台一键生成 48 字符 API Token 并填入 `xui.api_token`。
+- **3x-ui 鉴权双模式（v0.3 起）**：默认走 Bearer Token（`auth_mode = token` + `xui.api_token`）——主线 3x-ui v2.4+ 在面板设置中可一键生成 48 字符 API Token，无状态、不参与 CSRF，是最稳定的对接方式。少数 fork 版本（如某些 2.9.x）二进制内 `strings | grep -ic apitoken == 0`，根本未实现 apiToken 中间件——这种部署改用 `auth_mode = cookie` + `xui.username` + `xui.password`，中间件 POST `/login` 拿 session cookie 后续自动带上；遇到失效（401 / 302 / HTML 登录页 / `success=false` 含登录关键字）会自动重登录并重试一次。若 3x-ui 后台启用了 TOTP 2FA，可选填 `xui.totp_secret`（base32），中间件按 RFC 6238 算 6 位码塞 `twoFactorCode`。
+- **3x-ui cookie 模式的会话生命周期**：中间件持有 cookie 直到 3x-ui 端 session 失效（默认约 1 小时），失效后自动重登录。已知风险：a) 若 3x-ui 启用 CSRF middleware（v2.4+ 主线 / 某些 fork）且对 `/panel/api/*` 也强制 X-CSRF-Token，cookie 模式可能被拒（403）；当前实现按"无 CSRF"假设发请求，遇到 403 + CSRF 错误信息再扩展（详见 [docs/v0.3-roadmap.md §5.1](docs/v0.3-roadmap.md)）。b) cookie 模式下密码以明文存于 settings 表（admin 鉴权后可读）——与 token 同等敏感级别，运维需保护好 `bridge.db`（默认 0600）。c) TOTP 模式要求中间件主机与 3x-ui 主机系统时钟相差小于 30 秒（NTP 同步），裸跑容器请挂宿主时钟。
 - **启动期定型字段**：`log.*`（level / file / max_size_mb / max_backups / max_age_days）与 `web.*`（listen_addr / session_max_age_hours / absolute_max_lifetime_hours）这两组在进程启动时被消费一次；运行期 PATCH 会被 Web Handler 显式拒绝并提示运维 `sqlite3 编辑 settings 表后重启`。其余字段（Xboard / 3x-ui / 同步周期 / 上报开关 / bridges 全部 CRUD）支持热重载。
-- **删除桥接的清理**：当前删除 bridge 时不会清理对应的 traffic_baseline 行（占用极少，<1KB / 用户）；v0.3 计划增加 `store.DeleteBaselinesByBridge` 一次性清理。
+- **删除桥接的清理**：当前删除 bridge 时不会清理对应的 traffic_baseline 行（占用极少，<1KB / 用户）；v0.4 计划增加 `store.DeleteBaselinesByBridge` 一次性清理。
 
 ## 项目结构
 

@@ -122,7 +122,19 @@ export interface Bridge {
 export interface Settings {
   log: { level: string; file: string; max_size_mb: number; max_backups: number; max_age_days: number }
   xboard: { api_host: string; token: string; timeout_sec: number; skip_tls_verify: boolean; user_agent: string }
-  xui: { api_host: string; base_path: string; auth_mode: string; api_token: string; timeout_sec: number; skip_tls_verify: boolean }
+  // xui v0.3 起新增 username / password / totp_secret 三字段（仅 auth_mode='cookie' 时使用）；
+  // 切换 auth_mode 时另一组字段保留在表单中但被后端忽略——确保运维误切回原模式时不丢凭据。
+  xui: {
+    api_host: string
+    base_path: string
+    auth_mode: string
+    api_token: string
+    username: string
+    password: string
+    totp_secret: string
+    timeout_sec: number
+    skip_tls_verify: boolean
+  }
   intervals: { user_pull_sec: number; traffic_push_sec: number; alive_push_sec: number; status_push_sec: number }
   reporting: { alive_enabled: boolean; status_enabled: boolean }
   web: { listen_addr: string; session_max_age_hours: number; absolute_max_lifetime_hours: number }

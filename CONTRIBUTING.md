@@ -26,16 +26,35 @@
 
 ## 4. 配置变更（v0.2 起的"零 yaml" 流程）
 
-任何新增 / 重命名配置项都必须四处同步——缺一会导致用户写入的字段被静默忽略：
+任何新增 / 重命名配置项都必须**四处后端 + 三处前端**同步——缺一会导致用户写入的字段被静默忽略：
+
+**后端**：
 
   1. `internal/config/config.go` 顶部 `Setting*` 常量声明 key（命名约定 `<group>.<field>`）；
   2. `internal/config/config.go: LoadFromStore` 把该 key 映射到 `*config.Root` 字段；
   3. `internal/config/config.go: Validate` 完成默认值补齐与格式校验（"全空允许 / 半填严格"原则）；
-  4. `internal/web/settings_handler.go` 的 `settingsPatchRequest` + `buildSettingsKV` 表单层。
+  4. `internal/web/settings_handler.go` 中四处同步：`settingsResponse` 字段定义 / `settingsPatchRequest` 字段定义 / `projectSettings` 投影 / `buildSettingsKV` 写库映射。
+
+**前端（仅当字段需要在 Web 面板暴露给运维时）**：
+
+  5. `web/src/api/client.ts` 的 `Settings` interface 加新字段；`SettingsPatch` 是 mapped type 自动跟随，无需显式改；
+  6. `web/src/views/Settings.vue` 的 `form.<group>` 初值 + 模板表单 `v-model` 同步；
+  7. 新增"密码"或"TOTP secret"类敏感字段时，模板用 `<input type="password">`；并按 `auth_mode` 等条件字段动态显隐另一组互斥字段，避免运维误填闲置字段引发歧义。**例外**：`xui.api_token` 自 v0.2 起保持 plain input UX（不加 type=password），改动会破坏既有运维体验——新增字段不要参照该既有写法，按本条规范走。
 
 > **数据库不再有 yaml 解析的 `KnownFields(true)` 护栏**——SQLite 写入时不会拒绝拼错的 key，所以 `Setting*` 常量是唯一真相源；任何手写字符串都属于风格违规，PR 审查中必须用常量替换。
 
 历史背景：v0.1 通过 `gopkg.in/yaml.v3` 的 `KnownFields(true)` 阻止配置拼写错误；v0.2 改用 SQLite KV 后，这层护栏由"Web 表单写入路径只接受 `Setting*` 常量列出的 key"承担——具体实现详见 `internal/web/settings_handler.go` 的白名单逻辑。
+
+### 4.1 鉴权模式选择（v0.3 起）
+
+`xui.auth_mode` 是 v0.3 引入的双模式开关，决定 `internal/xui/client.go` 走哪条鉴权路径。开发新功能或修 bug 涉及该路径时，按下表判断影响面：
+
+| auth_mode | 何时用 | 涉及配置字段 | 何时不能用 |
+| --- | --- | --- | --- |
+| `token`（默认） | 主线 3x-ui v2.4+，已生成 API Token | `xui.api_token`（48 字符） | fork 不实现 apiToken 中间件（`strings $(which x-ui) \| grep -ic apitoken == 0`）的部署 |
+| `cookie` | fork 不支持 Bearer / 主线但管理员未启用 API Token | `xui.username` + `xui.password`（+ 可选 `xui.totp_secret`） | 3x-ui 对 `/panel/api/*` 强制 X-CSRF-Token 校验的 CSRF middleware（当前未实现兼容；遇到再扩展） |
+
+切换鉴权模式**不需要 db schema 迁移**——cookie 不持久化，进程重启后 `ensureLoggedIn` 自动重发 `/login`。`*config.Root.Xui` 同时容纳两组字段（token 模式忽略 `Username/Password/TOTPSecret`；cookie 模式忽略 `APIToken`），运维切回原模式时凭据不丢失。详见 `internal/xui/client.go` 头部注释 + `config.XuiAuthMode*` 常量注释。
 
 ## 5. 前端变更（v0.2 起的 SPA 流程）
 

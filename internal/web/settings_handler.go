@@ -30,10 +30,15 @@ type settingsResponse struct {
 		UserAgent     string `json:"user_agent"`
 	} `json:"xboard"`
 	Xui struct {
-		APIHost       string `json:"api_host"`
-		BasePath      string `json:"base_path"`
-		AuthMode      string `json:"auth_mode"`
-		APIToken      string `json:"api_token"`
+		APIHost  string `json:"api_host"`
+		BasePath string `json:"base_path"`
+		AuthMode string `json:"auth_mode"`
+		APIToken string `json:"api_token"`
+		// v0.3 新增（仅 cookie 模式生效）。前端按 auth_mode 切换显示这三个字段；
+		// 与 api_token 同等敏感级别，admin 鉴权后明文回传——前端如需 mask 自行处理。
+		Username      string `json:"username"`
+		Password      string `json:"password"`
+		TOTPSecret    string `json:"totp_secret"`
 		TimeoutSec    int    `json:"timeout_sec"`
 		SkipTLSVerify bool   `json:"skip_tls_verify"`
 	} `json:"xui"`
@@ -97,6 +102,9 @@ func projectSettings(cfg *config.Root) settingsResponse {
 	r.Xui.BasePath = cfg.Xui.BasePath
 	r.Xui.AuthMode = cfg.Xui.AuthMode
 	r.Xui.APIToken = cfg.Xui.APIToken
+	r.Xui.Username = cfg.Xui.Username
+	r.Xui.Password = cfg.Xui.Password
+	r.Xui.TOTPSecret = cfg.Xui.TOTPSecret
 	r.Xui.TimeoutSec = cfg.Xui.TimeoutSec
 	r.Xui.SkipTLSVerify = cfg.Xui.SkipTLSVerify
 
@@ -136,10 +144,14 @@ type settingsPatchRequest struct {
 		UserAgent     *string `json:"user_agent,omitempty"`
 	} `json:"xboard,omitempty"`
 	Xui *struct {
-		APIHost       *string `json:"api_host,omitempty"`
-		BasePath      *string `json:"base_path,omitempty"`
-		AuthMode      *string `json:"auth_mode,omitempty"`
-		APIToken      *string `json:"api_token,omitempty"`
+		APIHost  *string `json:"api_host,omitempty"`
+		BasePath *string `json:"base_path,omitempty"`
+		AuthMode *string `json:"auth_mode,omitempty"`
+		APIToken *string `json:"api_token,omitempty"`
+		// v0.3 新增（仅 cookie 模式生效）；运行期可热重载，不在"重启生效"白名单内。
+		Username      *string `json:"username,omitempty"`
+		Password      *string `json:"password,omitempty"`
+		TOTPSecret    *string `json:"totp_secret,omitempty"`
 		TimeoutSec    *int    `json:"timeout_sec,omitempty"`
 		SkipTLSVerify *bool   `json:"skip_tls_verify,omitempty"`
 	} `json:"xui,omitempty"`
@@ -260,6 +272,9 @@ func buildSettingsKV(req settingsPatchRequest) map[string]string {
 		setIfNotNil(kv, config.SettingXuiBasePath, req.Xui.BasePath)
 		setIfNotNil(kv, config.SettingXuiAuthMode, req.Xui.AuthMode)
 		setIfNotNil(kv, config.SettingXuiAPIToken, req.Xui.APIToken)
+		setIfNotNil(kv, config.SettingXuiUsername, req.Xui.Username)
+		setIfNotNil(kv, config.SettingXuiPassword, req.Xui.Password)
+		setIfNotNil(kv, config.SettingXuiTOTPSecret, req.Xui.TOTPSecret)
 		setIfNotNilInt(kv, config.SettingXuiTimeoutSec, req.Xui.TimeoutSec)
 		setIfNotNilBool(kv, config.SettingXuiSkipTLSVerify, req.Xui.SkipTLSVerify)
 	}
