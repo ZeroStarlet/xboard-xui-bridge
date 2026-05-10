@@ -90,9 +90,7 @@ const form = reactive({
   xui: {
     api_host: '',
     base_path: '',
-    username: '',
-    password: '',
-    totp_secret: '',
+    api_token: '',
     timeout_sec: 15,
     skip_tls_verify: false,
   },
@@ -250,11 +248,7 @@ onMounted(refresh)
         <CardContent>
           <Alert variant="info" role="status" class="mb-5">
             <AlertDescription>
-              <span>{{ t('settings.xui.infoBannerPrefix') }}</span>
-              <code class="rounded bg-info-100 px-1.5 py-0.5 font-mono text-[12px] dark:bg-info-900/40">
-                {{ t('settings.xui.infoBannerCode') }}
-              </code>
-              <span>{{ t('settings.xui.infoBannerSuffix') }}</span>
+              {{ t('settings.xui.infoBanner') }}
             </AlertDescription>
           </Alert>
           <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
@@ -266,28 +260,17 @@ onMounted(refresh)
               <Label for="s-xui-base_path">{{ t('settings.xui.fieldBasePath') }}</Label>
               <Input id="s-xui-base_path" v-model="form.xui.base_path" :placeholder="t('settings.xui.basePathPlaceholder')" class="mt-1.5" />
             </div>
-            <div>
-              <Label for="s-xui-username">{{ t('settings.xui.fieldUsername') }}</Label>
-              <Input id="s-xui-username" v-model="form.xui.username" autocomplete="off" class="mt-1.5" />
-            </div>
-            <div>
-              <Label for="s-xui-password">{{ t('settings.xui.fieldPassword') }}</Label>
-              <Input id="s-xui-password" v-model="form.xui.password" type="password" autocomplete="new-password" class="mt-1.5" />
-            </div>
             <div class="md:col-span-2">
-              <Label for="s-xui-totp_secret">
-                {{ t('settings.xui.fieldTotp') }}
-                <span class="text-xs font-normal text-muted-foreground">{{ t('settings.xui.totpHelp') }}</span>
-              </Label>
+              <Label for="s-xui-api_token">{{ t('settings.xui.fieldApiToken') }}</Label>
               <Input
-                id="s-xui-totp_secret"
-                v-model="form.xui.totp_secret"
+                id="s-xui-api_token"
+                v-model="form.xui.api_token"
                 type="password"
-                :placeholder="t('settings.xui.totpPlaceholder')"
                 autocomplete="off"
+                :placeholder="t('settings.xui.apiTokenPlaceholder')"
                 class="mt-1.5 font-mono"
               />
-              <p class="mt-1.5 text-xs text-muted-foreground">{{ t('settings.xui.totpClockHint') }}</p>
+              <p class="mt-1.5 text-xs text-muted-foreground">{{ t('settings.xui.apiTokenHelp') }}</p>
             </div>
             <div>
               <Label for="s-xui-timeout_sec">{{ t('settings.xui.fieldTimeout') }}</Label>

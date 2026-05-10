@@ -9,54 +9,45 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/cookiejar"
 	"net/url"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/config"
 )
 
-// Client 是 3x-ui 面板 API 客户端。
+// Client 是 3x-ui 面板 API 客户端，仅支持 Bearer API Token 单通道。
 //
-// 鉴权（v0.4 起仅 cookie 登录模式）：
+// 鉴权机制（v0.6 起，仅适配 3x-ui v3.0.0+，详见 internal/config/config.go
+// 文件头"3x-ui 鉴权说明"注释块）：
 //
-//	首次调用时 POST /login 拿 session cookie 存进 cookiejar，后续请求由
-//	net/http 自动带 cookie。鉴权失效（401 / 302 / HTML 登录页 / JSON
-//	success=false 含登录关键字）时自动重登录并重试一次；二次仍失败即返回
-//	*Error 让上层 sync 循环走 WARN 路径，下个周期再试。
+//	每次面板 API 请求都在请求头注入 "Authorization: Bearer <APIToken>"；
+//	3x-ui v3.0.0 内 APIController.checkAPIAuth 走 SettingService.MatchApiToken
+//	（constant-time compare）通道，校验通过后 c.Set("api_authed", true)，
+//	让 CSRFMiddleware 立即短路——token 模式下连 mutating（POST）请求都
+//	无需 X-CSRF-Token 头。
 //
-//	若 3x-ui 后台启用了 TOTP 2FA，构造时传 cfg.TOTPSecret（base32），每次
-//	/login 自动算 RFC 6238 6 位码塞 twoFactorCode 字段；未启用 2FA 留空即可。
+// 单一正向路径承诺：
+//
+//	a) 无登录、无 CSRF、无 cookie，请求路径只有"构造请求 → 注入 Bearer
+//	   头 → 发送 → 解码 commonResp"四步；
+//	b) 任何 4xx / 5xx / 网络错误都立即向上传播为 *Error，不在客户端层做
+//	   隐式重试 / 重登录 / 兜底响应；
+//	c) Token 错误（典型 401 / 404）= 运维在 3x-ui 面板重新生成 token 后
+//	   未同步到本中间件——立即报错让运维显式介入。
 //
 // 并发安全：
 //
-//	a) httpClient 自带连接池天然线程安全；cookiejar.Jar 内部用 sync.Mutex
-//	   保护 SetCookies/Cookies，并发读写无 race。
-//	b) doLogin 由 loginMu 串行化，防止多个 Bridge worker 同时触发 /login
-//	   造成"5 个 worker 各自登录 5 次"的请求风暴。
-//	c) loggedIn 字段同样由 loginMu 保护——仅 ensureLoggedIn / invalidateSession
-//	   两处读写，访问点都已持锁。
-//	d) baseURL / username / password / totpSecret 等构造后不可变字段无锁；
-//	   它们的读取行为对所有 goroutine 一致。
-//	e) listMu 保护 /list 端点的周期内合并缓存（v0.5.3 起引入），与 loginMu
-//	   独立——两者临界区不嵌套；listMu 仅保护短暂的 cache 状态读写。
+//	a) httpClient 自带连接池天然线程安全；本 Client 不持有 cookiejar，
+//	   也不需要登录串行化锁，构造后所有字段（baseURL / apiToken）皆为
+//	   只读，多 goroutine 并发请求无 race。
+//	b) listMu 保护 /list 端点的周期内合并缓存（v0.5.3 起引入），仅保护
+//	   短暂的 cache 状态读写，与请求路径无嵌套。
 type Client struct {
 	baseURL    string // host + base_path（不含尾 /）
-	username   string
-	password   string
-	totpSecret string // 3x-ui 启用 2FA 时使用；空串表示未启用
+	apiToken   string // Bearer 头注入值；构造后不可变
 	httpClient *http.Client
-
-	// loginMu 同时保护 loggedIn 与"是否正在 /login 中"。两处临界区不在同一
-	// 调用栈互相嵌套，所以一把互斥锁足够，无需 RWMutex。
-	loginMu sync.Mutex
-	// loggedIn 表示"此 Client 上一次成功 login 之后尚未被 invalidate"——
-	// 不代表服务端 cookie 一定还有效（cookie 失效仍要靠 sendOnce 探测，
-	// 然后 invalidateSession 把它翻回 false 触发重登录）。
-	loggedIn bool
 
 	// /panel/api/inbounds/list 端点的周期内合并缓存（v0.5.3）。
 	//
@@ -69,6 +60,9 @@ type Client struct {
 	// 跨周期使用"导致 user_sync 刚加的新 client 流量被推迟到下周期上报；
 	// 同时仍能让 traffic_sync + alive_sync 在同一周期内（典型间隔 < 1s）
 	// 共享一次拉取。
+	//
+	// 缓存仅作用于"已经鉴权通过的成功响应"，本身不绕过鉴权——任何
+	// fetchInbounds 失败都不会污染 cache。
 	listMu       sync.Mutex
 	listCache    []Inbound          // 上次成功拉取的 inbounds 快照（nil 与空切片均可能为合法成功结果，例如 obj=null）
 	listExpireAt time.Time          // 缓存有效性的真相源；零值或已过 = 缓存无效。listCache 自身不能用作"是否有缓存"的判定依据
@@ -101,12 +95,11 @@ type listFetchResult struct {
 
 // New 构造 Client。
 //
-// 不发起任何网络请求（/login 推迟到首次业务调用时由 ensureLoggedIn 触发），
-// 便于"半填配置"场景仍能完成 Client 构造，引擎后续 Reload 即可恢复。
+// 不发起任何网络请求——token 模式无需登录，请求注入仅在每次 do 时执行。
+// 这让"半填配置"场景仍能完成 Client 构造，引擎后续 Reload 即可恢复。
 //
-// 构造失败仅可能源于 cookiejar.New 返回错误——当前 Go 标准库对 nil options
-// 一定返回 nil error，但仍保留错误传递路径以适配未来 std 库变更。TLS 配置
-// 错误会被 *http.Transport 推迟到首次请求时报告，本函数不主动检测。
+// 构造失败原因仅可能源于 TLS 配置异常——但 *http.Transport 把 TLS 错误
+// 推迟到首次请求时报告，本函数不主动检测。
 func New(cfg config.Xui) (*Client, error) {
 	transport := &http.Transport{
 		// 不直接复用 http.DefaultTransport 的两个原因：
@@ -138,10 +131,9 @@ func New(cfg config.Xui) (*Client, error) {
 		IdleConnTimeout:     90 * time.Second,
 		// 细粒度超时：仅约束 TLS 握手 / 服务端读完 header / 100-Continue
 		// 三个 IO 子阶段。10s / 10s / 1s 远高于正常 3x-ui 响应时间
-		// （< 200ms），远低于默认 client.Timeout=15s。/login 路径同样适用
-		// ——3x-ui 主线 LoginForm 处理 < 50ms，10s ResponseHeaderTimeout
-		// 不会误伤。注意：这些超时不覆盖 DNS/TCP dial 与响应体读取——
-		// 后两者仍由 httpClient.Timeout 端到端兜底。
+		// （< 200ms），远低于默认 client.Timeout=15s。
+		// 注意：这些超时不覆盖 DNS/TCP dial 与响应体读取——后两者仍由
+		// httpClient.Timeout 端到端兜底。
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
@@ -154,26 +146,14 @@ func New(cfg config.Xui) (*Client, error) {
 		ForceAttemptHTTP2: true,
 	}
 
-	// 3x-ui 用 gin sessions 默认 cookie 名 "session" 且 HttpOnly + Path=/，
-	// 标准 cookiejar 自动处理域 / 路径作用域，无需特殊配置。
-	// 使用 nil options：默认 PublicSuffixList=nil 不做公共后缀过滤，对 IP 直连
-	// 与本地局域网域名都友好。
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		return nil, fmt.Errorf("初始化 cookie jar：%w", err)
-	}
-
 	httpClient := &http.Client{
 		Transport: transport,
 		Timeout:   time.Duration(cfg.TimeoutSec) * time.Second,
-		Jar:       jar,
 	}
 
 	c := &Client{
 		baseURL:    cfg.APIHost + cfg.BasePath,
-		username:   cfg.Username,
-		password:   cfg.Password,
-		totpSecret: cfg.TOTPSecret,
+		apiToken:   cfg.APIToken,
 		httpClient: httpClient,
 	}
 	return c, nil
@@ -209,6 +189,16 @@ func (c *Client) GetInbound(ctx context.Context, id int) (*Inbound, error) {
 	return &ib, nil
 }
 
+// ErrInboundNotFound 表示通过 GET /panel/api/inbounds/list 没找到目标 inbound。
+//
+// 调用方拿到本错误应理解为"3x-ui 端确实没有该 inbound"——可能根因是 inbound
+// 被运维删除、token 模式下 SetAPIAuthUser(GetFirstUser) 拿到的账户不拥有
+// 该 inbound（多用户面板下的隐性差异）、或中间件 bridge 配置中的 XuiInboundID
+// 写错。返回明确 sentinel 错误而非 nil 切片，是项目"单一正向路径"承诺的具体
+// 落实——v0.5.x 时代用"返回 nil 当作无 client"的兜底语义已被移除：找不到
+// 就是找不到，调用方显式失败让运维立即可见。
+var ErrInboundNotFound = errors.New("xui: /list 中未找到目标 inbound（请检查 inbound 是否被删除 / bridge 的 xui_inbound_id 是否正确 / token 对应的账户是否拥有该 inbound）")
+
 // GetClientTrafficsByInboundID 拉取指定 inbound 下所有 client 的流量统计。
 //
 // v0.5.1 关键修复（v0.5 及之前一直误用，导致 Xboard 端流量永远 0）：
@@ -228,8 +218,7 @@ func (c *Client) GetInbound(ctx context.Context, id int) (*Inbound, error) {
 //	（UUID 字符串如 "550e8400-e29b-41d4-a716-446655440000"）做相等匹配——
 //	**永远匹配不到任何 client**，端点返回空数组。表现为 traffic_sync 循环
 //	zero 次进入、alive_sync myEmails 永远为空——直接造成 Xboard 用户 u/d
-//	永远 0 与 alive 永远空 push 这两个综合症状（v0.5 心跳让节点不再标
-//	"无人使用或异常"，但真实流量与在线 IP 数据从未抵达 Xboard）。
+//	永远 0 与 alive 永远空 push 这两个综合症状。
 //
 // 正确做法（v0.5.1 切换至 /list 端点）：
 //
@@ -246,14 +235,14 @@ func (c *Client) GetInbound(ctx context.Context, id int) (*Inbound, error) {
 //	     被 Codex 审查发现）。详见 GetInbound 注释。
 //
 //	  b) /list 走 GetInbounds(userId) 用 WHERE user_id = ? **严格过滤**——
-//	     登录账户只能看到自己 user_id 下的 inbound（3x-ui 主线 controller
-//	     不对 admin 切换走 GetAllInbounds 分支）。生产部署必须让中间件
-//	     登录账户与目标 inbound 的所有者完全一致；多用户场景下若中间件
-//	     用子账户登录但目标 inbound 属于另一账户，user_sync 仍可能通过
-//	     /get/:id（不按 user_id 过滤）正常运行，traffic_sync 却永远从
-//	     /list 拿不到该 inbound——表现为"流量永远 0 + 节点状态正常"。
-//	     这种隐性不一致没法在中间件内自动检出，只能从"reported_users=0
-//	     + heartbeat_only=true 持续多周期 + Xboard 端真实流量为 0"反查权限。
+//	     登录账户只能看到自己 user_id 下的 inbound。token 模式下 3x-ui v3.0.0
+//	     APIController.checkAPIAuth 通过 MatchApiToken 后调用
+//	     session.SetAPIAuthUser(c, GetFirstUser())——所以 token 模式实际看到
+//	     的是"第一个用户"的 inbound 集合。多用户面板下若运维不是 user_id=1
+//	     的管理员、或存在多个 admin 账户，目标 inbound 必须属于 GetFirstUser
+//	     才能被 /list 看到。本函数拿到不到目标 inbound 时显式返回
+//	     ErrInboundNotFound，配合 v0.6 移除 sync 层心跳兜底，运维在
+//	     traffic_sync 失败日志里能立刻看到根因。
 //
 //	  c) 体积权衡：拉所有 inbound 比单条 inbound 多带 N-1 倍 settings JSON。
 //	     3x-ui 一个面板典型 inbound 数 < 10、单 inbound client 数 < 数千，
@@ -262,17 +251,15 @@ func (c *Client) GetInbound(ctx context.Context, id int) (*Inbound, error) {
 //	     /get/:id 取 settings.clients[*].email，再批量调 /getClientTraffics/:email"
 //	     的 N+1 路径——但当前阶段无此需求。
 //
-// 调用方契约不变：仍返回 []ClientTraffic。
+// 调用方契约（v0.6 起调整）：
 //   - 找到目标 inbound 且其 ClientStats 非空 → 真实流量列表
 //   - 找到目标 inbound 但 ClientStats 为空 → nil 切片。注意 3x-ui 在
 //     AddInboundClient 时通常会一并创建对应的 client_traffics 行（即使
 //     up/down 都是 0），所以正常运行下 ClientStats 不应为空；如果观察到
 //     非 0 用户数 inbound 仍返回空 stats，更可能是 inbound 刚建尚无 client、
-//     运维手动重置过 stats 表、或 /list 端 Preload 失败等异常情形——
-//     不视为合法的"客户全部从未连接"语义。
-//   - /list 响应中找不到目标 inbound id → nil 切片（运维配置或权限问题，调用
-//     方走心跳兜底；选择 nil 而非 sentinel error 是为了让 traffic_sync 在
-//     "inbound 临时缺失"时仍能维持节点 STATUS_ONLINE，而不是直接报错中断）
+//     运维手动重置过 stats 表、或 /list 端 Preload 失败等异常情形。
+//   - /list 响应中找不到目标 inbound id → 返回 ErrInboundNotFound（v0.6
+//     起从"返回 nil 切片"改为显式错误；理由详见 ErrInboundNotFound 注释）。
 //   - 网络 / 鉴权 / 5xx 错误 → 走 c.do 的标准错误链，向调用方传播
 func (c *Client) GetClientTrafficsByInboundID(ctx context.Context, inboundID int) ([]ClientTraffic, error) {
 	// v0.5.3 起改走 fetchInboundsCached：单 Client 实例下，多 Bridge 在同
@@ -285,15 +272,14 @@ func (c *Client) GetClientTrafficsByInboundID(ctx context.Context, inboundID int
 	for _, ib := range inbounds {
 		if ib.ID == inboundID {
 			// 找到目标 inbound：返回其 ClientStats（已经被 Preload + enrich）。
-			// 切片可能 nil（无 client）——调用方按 nil/empty 处理即可，与
-			// "/list 中找不到目标 inbound"的语义合并是有意为之，详见函数头注释。
+			// 切片可能 nil（无 client）——调用方按 nil/empty 处理即可。
 			return ib.ClientStats, nil
 		}
 	}
-	// /list 不含目标 inbound id：返回 nil 切片（与"无 client"等价语义合并）。
-	// 不返回 error 是为了让 traffic_sync 进入心跳兜底维持节点 STATUS_ONLINE，
-	// 避免运维改动 inbound id / 改子账户权限期间节点直接被标"无人使用或异常"。
-	return nil, nil
+	// /list 不含目标 inbound id：v0.6 起返回 ErrInboundNotFound，让上层
+	// sync 循环在日志里显式打出该错误根因（不再被静默兜底为"无在线 / 无
+	// 流量"）。
+	return nil, fmt.Errorf("inbound_id=%d：%w", inboundID, ErrInboundNotFound)
 }
 
 // fetchInbounds 直接发 GET /panel/api/inbounds/list 并解码 obj 字段。
@@ -314,7 +300,8 @@ func (c *Client) fetchInbounds(ctx context.Context) ([]Inbound, error) {
 		return nil, err
 	}
 	// 3x-ui 在用户没有 inbound 时返回 obj=null。统一收口为"无可用数据"
-	// 而非解码错误，让上层走"无 client"分支不被噪声打断。
+	// 而非解码错误——这不是失败兜底，而是协议合法响应（obj=null 是
+	// commonResp 在"该用户名下无 inbound"场景的正常输出形式）。
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, nil
 	}
@@ -437,6 +424,18 @@ func (c *Client) DelClientByEmail(ctx context.Context, inboundID int, email stri
 //
 // 中间件主要用 GetOnlines() 拿在线 email，再拿 GetClientIPs 找该 email 当下使用的 IP。
 // 时间戳信息保留在原始字符串中（"1.2.3.4 (2024-01-02 15:04:05)"），调用方自行解析。
+//
+// 协议合法响应形态（仅以下三种被视为成功，全部映射为 (nil, nil) 或数组）：
+//
+//	a) obj=null 或空 body                  → (nil, nil)（IP 表无该 email 行）
+//	b) obj 为字符串 "No IP Record"          → (nil, nil)（3x-ui 主线 controller
+//	                                          在 inboundService.GetInboundClientIps
+//	                                          返回空 / err 时显式输出该字面值）
+//	c) obj 为 JSON 数组（可空）              → 转切片返回
+//
+// 任何其它形态（数字 / 对象 / 其它字符串等）一律视为协议错误向上传播——
+// 这不是失败兜底，是"无数据 vs 协议异常"语义边界的显式拦截，避免静默
+// 把异常响应映射成空切片导致 alive_sync 少报用户。
 func (c *Client) GetClientIPs(ctx context.Context, email string) ([]string, error) {
 	endpoint := "/panel/api/inbounds/clientIps/" + url.PathEscape(email)
 	raw, err := c.do(ctx, http.MethodPost, endpoint, nil)
@@ -446,16 +445,30 @@ func (c *Client) GetClientIPs(ctx context.Context, email string) ([]string, erro
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, nil
 	}
-	// 3x-ui 端 obj 字段在"无 IP 记录"时可能返回字符串 "No IP Record" 而不是数组，
-	// 需要双形态兼容；只在数组形态下解析。
-	if raw[0] != '[' {
-		return nil, nil
+	// 数组形态：直接解码返回。
+	if raw[0] == '[' {
+		var out []string
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return nil, fmt.Errorf("解码 %s 响应：%w", endpoint, err)
+		}
+		return out, nil
 	}
-	var out []string
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, fmt.Errorf("解码 %s 响应：%w", endpoint, err)
+	// 字符串形态：仅接受 "No IP Record" 字面值；其它字符串一律报错。
+	// 不接受任何其它字符串字面值（如未来 fork 改文案）：让协议变化时立刻
+	// 显式失败，由维护者更新本判断而不是静默吞掉，与"单一正向路径"承诺
+	// 一致。
+	if raw[0] == '"' {
+		var msg string
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			return nil, fmt.Errorf("解码 %s 响应（字符串形态）：%w", endpoint, err)
+		}
+		if msg == "No IP Record" {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("解码 %s 响应：obj 为意外字符串 %q（仅接受数组 / null / \"No IP Record\"）", endpoint, msg)
 	}
-	return out, nil
+	// 数字 / 对象 / 布尔等其它类型：协议异常，立即报错。
+	return nil, fmt.Errorf("解码 %s 响应：obj 既非数组也非 \"No IP Record\"：%s", endpoint, truncate(string(raw), 128))
 }
 
 // GetOnlines 调用 POST /panel/api/inbounds/onlines；返回当前在线的 email 列表。
@@ -487,109 +500,50 @@ func (c *Client) GetServerStatus(ctx context.Context) (json.RawMessage, error) {
 
 // do 是所有面板 API 共享的传输层。
 //
-// v0.4 起的语义（仅 cookie 模式）：
+// 单一正向路径：
 //
-//	1. ensureLoggedIn 确保 cookiejar 中有有效 session cookie；登录失败立刻
-//	   返回 *Error，不发出"必然 401"的无效业务请求；
-//	2. sendOnce 发一次请求；若返回 authStale=true（looksLikeAuthFailed 识别）
-//	   则 invalidateSession + ensureLoggedIn + sendOnce 第二次；
-//	3. 第二次仍 stale → 立刻报错，绝不返回 (nil, nil) 让 mutating 端点
-//	   （AddClient / UpdateClient 等）误判"已写入"。
+//	1. 序列化 body（如有）；
+//	2. 构造 *http.Request 并注入 Authorization: Bearer 头；
+//	3. 发送一次；
+//	4. 读响应 → 解码 commonResp → 返回 obj 或 *Error。
 //
-// body 重读保护：把序列化结果保留在 bodyBytes 中，sendOnce 内部用
-// bytes.NewReader 重新构造 io.Reader——确保重试时 body 不会因为已被
-// http.Client.Do 消费而 EOF（io.Reader 不可重读 pitfall）。
+// 任意一步失败立即返回 *Error；不做重试 / 重登录 / 兜底响应——这是项目
+// "单一正向路径"承诺的具体落实。
 func (c *Client) do(ctx context.Context, method, endpoint string, body any) (json.RawMessage, error) {
 	full := c.baseURL + endpoint
 
-	var bodyBytes []byte
+	var bodyReader io.Reader
 	if body != nil {
-		var err error
-		bodyBytes, err = json.Marshal(body)
+		bodyBytes, err := json.Marshal(body)
 		if err != nil {
 			return nil, fmt.Errorf("序列化 %s body：%w", endpoint, err)
 		}
-	}
-
-	if err := c.ensureLoggedIn(ctx); err != nil {
-		return nil, fmt.Errorf("登录 3x-ui：%w", err)
-	}
-
-	raw, authStale, err := c.sendOnce(ctx, method, full, endpoint, bodyBytes)
-	if !authStale {
-		return raw, err
-	}
-
-	// 重登录 + 重试一次。第二次仍 stale → 立刻报错，避免返回 (nil, nil) 让上层
-	// 误判"业务成功但 obj 为 null"——AddClient / UpdateClient / DelClientByEmail
-	// 等 mutating 端点拿到 err==nil 会直接进入"已写入"状态机，破坏一致性。
-	c.invalidateSession()
-	if err := c.ensureLoggedIn(ctx); err != nil {
-		return nil, fmt.Errorf("重登录 3x-ui：%w", err)
-	}
-	retriedRaw, retriedStale, retriedErr := c.sendOnce(ctx, method, full, endpoint, bodyBytes)
-	if retriedStale {
-		// 重登录后第二次请求仍被判鉴权失效——常见根因：
-		//   a) 运维在 3x-ui 后台改了密码但中间件 settings 未同步；
-		//   b) 3x-ui 启用了暴力破解保护，连续 /login 触发临时锁定；
-		//   c) 3x-ui 启用了 CSRF middleware（v2.4+ 主线 fork 行为可能不同），
-		//      cookie 登录后还需 X-CSRF-Token——v0.4 暂不实现，遇到时再扩展。
-		// 这里返回明确 *Error 而不是 (nil, nil)，确保 mutating 调用（AddClient
-		// 等）不会把"未写入"误当作"已写入"。
-		return nil, &Error{
-			HTTPStatus: 0,
-			Endpoint:   endpoint,
-			Msg:        "重登录后仍被判鉴权失效（凭据可能变更 / 服务端限流 / 启用了 CSRF 校验）",
-		}
-	}
-	return retriedRaw, retriedErr
-}
-
-// sendOnce 发一次 HTTP 请求并解析响应。
-//
-// 返回三元组（authStale × err 二维区分）：
-//
-//	(obj, false, nil)  → 成功，obj 为 commonResp.obj 字段（可能为 null）；
-//	(nil, false, err)  → 普通错误（网络 / 4xx 非鉴权 / 5xx / success=false 业务错）；
-//	(nil, true, nil)   → 检测到鉴权失效，调用方应触发重登录 + 重试。
-//
-// 不让"鉴权失效"作为 err 的特例，是为了让上层用 if authStale 判别比 errors.Is
-// 更直观；err 永远表达"无法继续"语义，调用方拿到 err 直接返回即可。
-//
-// 入参 endpoint 仅用于 *Error 的诊断标签——与 fullURL 解耦，便于日志中既能
-// 看到完整 URL 又能保留语义化的端点路径。
-//
-// 鉴权策略：cookie 由 httpClient.Jar 自动注入；本函数不手动 Set("Cookie", ...)
-// 是为了让 jar 的"路径作用域 / 过期处理"语义完整生效。
-func (c *Client) sendOnce(ctx context.Context, method, fullURL, endpoint string, bodyBytes []byte) (json.RawMessage, bool, error) {
-	var bodyReader io.Reader
-	if bodyBytes != nil {
 		bodyReader = bytes.NewReader(bodyBytes)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, fullURL, bodyReader)
+
+	req, err := http.NewRequestWithContext(ctx, method, full, bodyReader)
 	if err != nil {
-		return nil, false, fmt.Errorf("构造 %s 请求：%w", endpoint, err)
+		return nil, fmt.Errorf("构造 %s 请求：%w", endpoint, err)
 	}
-	if bodyBytes != nil {
+	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("Accept", "application/json")
+	// Bearer 头：每次请求都注入；3x-ui v3.0.0 APIController.checkAPIAuth
+	// 在该头部前缀匹配 "Bearer " 后调 SettingService.MatchApiToken（constant
+	// time compare），通过即 c.Set("api_authed", true)，CSRFMiddleware 短路。
+	req.Header.Set("Authorization", "Bearer "+c.apiToken)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, false, &Error{HTTPStatus: 0, Endpoint: endpoint, Msg: err.Error()}
+		return nil, &Error{HTTPStatus: 0, Endpoint: endpoint, Msg: err.Error()}
 	}
 	defer drainAndClose(resp.Body)
 
 	rawBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024)) // 4MB 兜底，避免巨型响应耗内存
 
-	// 识别"鉴权失效"——上层 do() 收到 authStale=true 会触发重登录 + 重试一次。
-	if c.looksLikeAuthFailed(resp, rawBody) {
-		return nil, true, nil
-	}
-
 	if resp.StatusCode/100 != 2 {
-		return nil, false, &Error{
+		return nil, &Error{
 			HTTPStatus: resp.StatusCode,
 			Endpoint:   endpoint,
 			Msg:        sniffMsg(rawBody),
@@ -600,7 +554,7 @@ func (c *Client) sendOnce(ctx context.Context, method, fullURL, endpoint string,
 	// 解析 commonResp。3x-ui 全量端点都遵循该外壳。
 	var cr commonResp
 	if err := json.Unmarshal(rawBody, &cr); err != nil {
-		return nil, false, &Error{
+		return nil, &Error{
 			HTTPStatus: resp.StatusCode,
 			Endpoint:   endpoint,
 			Msg:        "响应非 JSON",
@@ -608,216 +562,14 @@ func (c *Client) sendOnce(ctx context.Context, method, fullURL, endpoint string,
 		}
 	}
 	if !cr.Success {
-		return nil, false, &Error{
+		return nil, &Error{
 			HTTPStatus: resp.StatusCode,
 			Endpoint:   endpoint,
 			Msg:        cr.Msg,
 			RawBody:    truncate(string(rawBody), 512),
 		}
 	}
-	return cr.Obj, false, nil
-}
-
-// ensureLoggedIn 确保 cookie 模式下当前 Client 已经持有有效 cookie。
-//
-// 行为：
-//
-//	a) 已 loggedIn → 立即返回 nil（仍走一次锁，防止"doLogin 进行中其他 goroutine
-//	   误判已登录直接发请求"导致的乱序）；
-//	b) 未 loggedIn → 调用 doLogin 一次，成功后置 loggedIn=true 返回 nil；
-//	c) doLogin 失败 → 不动 loggedIn，原样返回错误（错误链含原因）。
-//
-// 仅 cookie 模式调用此函数；token 模式无登录概念。调用方负责模式判别。
-func (c *Client) ensureLoggedIn(ctx context.Context) error {
-	c.loginMu.Lock()
-	defer c.loginMu.Unlock()
-	if c.loggedIn {
-		return nil
-	}
-	if err := c.doLogin(ctx); err != nil {
-		return err
-	}
-	c.loggedIn = true
-	return nil
-}
-
-// invalidateSession 把 loggedIn 翻成 false，强制下一次 ensureLoggedIn 重发 /login。
-//
-// 不主动清空 cookie jar：3x-ui 服务端在重新 /login 成功时返回的 Set-Cookie
-// 会用同名 cookie 覆盖 jar 中的旧条目（gin sessions 默认 cookie 名 "session"），
-// 所以"旧 cookie 还在 jar 里"仅在两次 ensureLoggedIn 之间的极短窗口存在，
-// 且因 loggedIn=false 此时不会有请求被发出。手动清 jar 反而需要替换
-// httpClient.Jar 字段，与 client.Do 的并发读取构成 race，得不偿失。
-func (c *Client) invalidateSession() {
-	c.loginMu.Lock()
-	defer c.loginMu.Unlock()
-	c.loggedIn = false
-}
-
-// looksLikeAuthFailed 判定一次 cookie 模式响应是否属于"鉴权失效"。
-//
-// 3x-ui 主线 + 多种 fork 在 cookie 失效时的兜底响应不一致，按观察到的几种形态
-// 兜底匹配：
-//
-//	a) HTTP 401 / 403：标准错误码；
-//	b) HTTP 200 + body 以 < 开头：被默认 redirect-follow 引到了 /login 的 HTML 页；
-//	c) HTTP 200 + JSON {"success":false,"msg":"login session timeout"} 等：
-//	   按 msg 关键字识别（覆盖中英文 + fork 扩展词）。
-//
-// 误判风险：业务接口（非 /login）返回 success=false 且 msg 含"login"等字眼
-// 的概率极低（3x-ui inbound API 的错误信息不会出现"login""session"）；
-// 即使误判，最坏后果也只是"多发一次 /login + 重试本次请求"——没有数据正确
-// 性风险，性能损耗可忽略。
-func (c *Client) looksLikeAuthFailed(resp *http.Response, body []byte) bool {
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return true
-	}
-	if resp.StatusCode != http.StatusOK || len(body) == 0 {
-		return false
-	}
-	// HTML 探测：去除前导空白后首字符 '<' 即视作 HTML。3x-ui 的合法 JSON 响应
-	// 永远以 '{' 或 '[' 开头，不与此冲突。
-	head := bytes.TrimLeft(body, " \t\r\n")
-	if len(head) > 0 && head[0] == '<' {
-		return true
-	}
-	// 解析 commonResp 探测 success=false + msg 关键字。
-	var probe struct {
-		Success bool   `json:"success"`
-		Msg     string `json:"msg"`
-	}
-	if err := json.Unmarshal(body, &probe); err != nil || probe.Success {
-		return false
-	}
-	msgLower := strings.ToLower(probe.Msg)
-	// 中英文双语关键字穷举：覆盖主线 + 已知 fork 的常见输出。
-	// 注意 "login" 会同时匹配 "please login""login required""login session timeout"
-	// 等等；"session" 兜住"session timeout""session expired"。中文 "登录" / "登入"
-	// 兼容大陆 / 港台不同译法。
-	for _, kw := range []string{"login", "session", "未登录", "未登入", "登录已过期", "登入已过期", "请登录", "请登入"} {
-		if strings.Contains(msgLower, kw) || strings.Contains(probe.Msg, kw) {
-			return true
-		}
-	}
-	return false
-}
-
-// doLogin 调用 3x-ui /login 拿 session cookie。
-//
-// 请求：
-//
-//	POST {baseURL}/login
-//	Content-Type: application/json
-//	Accept: application/json
-//	{"username":"...","password":"...","twoFactorCode":"..."}
-//
-// 关于 body 格式：3x-ui 主线 web/controller/index.go 用 c.ShouldBind 自动按
-// Content-Type 选 binding，JSON / form-urlencoded 两种都接受。本中间件统一
-// 走 JSON——既现代化、与本包其它请求一致，又对 fork 中可能的"严格 form
-// binding"具有更好的语义稳定性。
-//
-// 响应：
-//
-//	HTTP 200 + Set-Cookie: session=... + body {"success":true,...} → 登录成功；
-//	HTTP 200                            + body {"success":false,...} → 业务失败，
-//	                                                                按 msg 关键字
-//	                                                                分流为 ErrTOTPRequired
-//	                                                                或 ErrInvalidCredentials；
-//	非 2xx                                                          → *Error 抛出。
-//
-// TOTP 处理：若 totpSecret 非空，调 generateTOTP 算"此刻"6 位码塞 twoFactorCode；
-// 否则发空串（3x-ui 的 LoginForm 字段允许缺失/为空，未启用 2FA 的部署不会因此
-// 失败）。
-//
-// 不在此函数内重试：HTTP 层失败 / 凭据错误 / TOTP 错误都需要运维介入，自动重试
-// 既无意义又可能触发服务端账户锁定。
-//
-// 调用契约：调用方必须持 loginMu（由 ensureLoggedIn 保证）。doLogin 自身不
-// 二次加锁——重入锁会让 ensureLoggedIn 的语义复杂化得不偿失。
-func (c *Client) doLogin(ctx context.Context) error {
-	var twoFactorCode string
-	if c.totpSecret != "" {
-		code, err := generateTOTP(c.totpSecret)
-		if err != nil {
-			return fmt.Errorf("计算 TOTP 码：%w", err)
-		}
-		twoFactorCode = code
-	}
-
-	payload := struct {
-		Username      string `json:"username"`
-		Password      string `json:"password"`
-		TwoFactorCode string `json:"twoFactorCode"`
-	}{c.username, c.password, twoFactorCode}
-
-	bodyBytes, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("序列化 /login body：%w", err)
-	}
-
-	full := c.baseURL + "/login"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, full, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return fmt.Errorf("构造 /login 请求：%w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return &Error{HTTPStatus: 0, Endpoint: "/login", Msg: err.Error()}
-	}
-	defer drainAndClose(resp.Body)
-
-	rawBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
-
-	if resp.StatusCode/100 != 2 {
-		return &Error{
-			HTTPStatus: resp.StatusCode,
-			Endpoint:   "/login",
-			Msg:        sniffMsg(rawBody),
-			RawBody:    truncate(string(rawBody), 512),
-		}
-	}
-
-	var cr commonResp
-	if err := json.Unmarshal(rawBody, &cr); err != nil {
-		return &Error{
-			HTTPStatus: resp.StatusCode,
-			Endpoint:   "/login",
-			Msg:        "响应非 JSON",
-			RawBody:    truncate(string(rawBody), 512),
-		}
-	}
-	if !cr.Success {
-		// 关键字识别：覆盖主线 + 中英文 fork 的"需要 2FA"措辞。
-		// strings.ToLower 仅对 ASCII 字母有效，中文关键字直接对原 Msg 匹配。
-		msgLower := strings.ToLower(cr.Msg)
-		for _, kw := range []string{"two factor", "2fa"} {
-			if strings.Contains(msgLower, kw) {
-				return ErrTOTPRequired
-			}
-		}
-		for _, kw := range []string{"二次验证", "二步验证", "动态密码", "双重认证"} {
-			if strings.Contains(cr.Msg, kw) {
-				return ErrTOTPRequired
-			}
-		}
-		return ErrInvalidCredentials
-	}
-
-	// 防御性校验：success=true 但服务端没真的下发 cookie——3x-ui 主线不会发生，
-	// 但 fork 的实现细节可能有差异。这种情况下"loggedIn=true 但 jar 是空"会让
-	// 业务请求被服务端再次判定为失效，进而触发"重登录—又登录—又失败"循环。
-	// 直接判 fail 让运维立刻看到错误根因。
-	if c.httpClient.Jar != nil {
-		u, parseErr := url.Parse(c.baseURL + "/")
-		if parseErr == nil && len(c.httpClient.Jar.Cookies(u)) == 0 {
-			return errors.New("/login 返回 success=true 但未下发 cookie；3x-ui 服务端行为异常")
-		}
-	}
-
-	return nil
+	return cr.Obj, nil
 }
 
 // truncate 把字符串截到最多 max 字节，超长部分用 "…" 标记，便于日志阅读。

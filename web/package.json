@@ -1,7 +1,7 @@
 {
   "name": "xboard-xui-bridge-web",
   "private": true,
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Web GUI for xboard-xui-bridge — Vue 3 + Vite + Tailwind + shadcn-vue + vue-i18n. Built artifacts copied into ../internal/web/dist/ for go:embed.",
   "scripts": {

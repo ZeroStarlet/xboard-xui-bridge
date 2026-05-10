@@ -126,7 +126,18 @@ type rawSettings struct {
 // 同一物理 inbound 被换绑过 node_id 时，"看起来托管"的 email 实际属于其他
 // bridge；只有 node_id 完全匹配才能纳入 diff，否则可能误删其他 bridge 的 client。
 //
-// 解析失败 = 配置异常，向上返回错误中断本次循环。
+// 失败语义（v0.6 单一正向路径承诺）：
+//
+//	a) 顶层 settings JSON 解码失败 → 立即返回 error；
+//	b) settings.clients 数组中**任意一条**单元素 JSON 解码失败 → 立即返回
+//	   error。v0.5.x 时代的"单条解码失败 continue 维持原状"已被删除——
+//	   那种"安全降级"会让 diff 基于不完整现状继续执行，可能误删本应保留
+//	   的 client（diff 把"现状中没看到"当成"3x-ui 端真的没有"）；
+//	c) email 通过 IsManaged 后 ParseEmail 失败（"xboard_" 前缀但格式异常）
+//	   → 立即返回 error。这是数据腐烂迹象，必须显式可见，不能继续沉默；
+//	d) email 不是托管前缀 → continue（合法：3x-ui 上的非托管 client）；
+//	e) email 是托管前缀但 node_id 与本 bridge 不匹配 → continue（合法：
+//	   多 bridge 共享 inbound 的边界，跨 node_id 不属于本次 diff）。
 func (w *bridgeWorker) parseExistingManagedClients(raw json.RawMessage) (map[string]xui.ClientSettings, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return map[string]xui.ClientSettings{}, nil
@@ -142,19 +153,26 @@ func (w *bridgeWorker) parseExistingManagedClients(raw json.RawMessage) (map[str
 	}
 
 	out := make(map[string]xui.ClientSettings, len(s.Clients))
-	for _, raw := range s.Clients {
+	for idx, raw := range s.Clients {
 		var c xui.ClientSettings
 		if err := json.Unmarshal(raw, &c); err != nil {
-			// 单条解码失败不阻断全量；只是这条 client 不会被识别成托管对象，
-			// 不会被中间件改动，最坏退化为"维持原状"，安全。
-			continue
+			// 单条解码失败立即报错——v0.5.x 的"continue 维持原状"已删除：
+			// 维持原状会让 diff 漏算这条 client，可能误删 / 误重建。
+			return nil, fmt.Errorf("解析 settings.clients[%d] 失败：%w", idx, err)
 		}
 		if !protocol.IsManaged(c.Email) {
+			// 非托管前缀的 client（运维手动添加 / 老用户）→ 不纳入 diff 范围。
 			continue
 		}
-		// node_id 不匹配的 "xboard_*" email 视为他属，不纳入本 Bridge 的 diff。
 		_, nodeID, perr := protocol.ParseEmail(c.Email)
-		if perr != nil || nodeID != w.cfg.XboardNodeID {
+		if perr != nil {
+			// IsManaged 通过但 ParseEmail 失败 = "xboard_" 前缀但其余字段
+			// 腐烂（缺 uuid_segment / 缺 node_id / 分隔符错位）。这是数据
+			// 异常，必须显式报错让运维诊断。
+			return nil, fmt.Errorf("settings.clients[%d] email %q 是托管前缀但 ParseEmail 失败：%w", idx, c.Email, perr)
+		}
+		if nodeID != w.cfg.XboardNodeID {
+			// 跨 bridge 的合法情形：xboard_ 前缀但 node_id 不属于本 bridge。
 			continue
 		}
 		out[c.Email] = c

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"strconv"
 	"strings"
 	stdsync "sync"
@@ -22,86 +21,42 @@ import (
 //     该 inbound 内的 email 集合 myEmails。
 //  2. 拉全局在线 email（GetOnlines）取 onlineAll。
 //  3. onlineMine = onlineAll ∩ myEmails；逐个调 GetClientIPs 解析最近 IP。
-//  4. 真实 IP 缺失时（详见下方 v0.5.2 关键修复）走 placeholder 兜底，
-//     至少让 Xboard 端"在线设备"反映"该 user 在线"。
-//  5. 把 (xboard_user_id → [ip...]) 形态写入 AliveMap，调 PushAlive 上报。
+//  4. 把 (xboard_user_id → [ip...]) 形态写入 AliveMap，调 PushAlive 上报。
 //
 // 并发：GetClientIPs 是逐个 email 的串行接口，inbound 内在线用户多时延迟会显著。
 //
 //	采用受限并发（信号量限并发数 8）平衡 3x-ui 面板压力 vs 吞吐。
 //
-// 错误处理：
+// 错误处理（v0.6 单一正向路径承诺）：
 //
-//	a) 某个 email 拉 IPs 失败：记录 warn，跳过该用户继续，不影响其他用户上报。
-//	b) PushAlive 失败：返回错误中断本次循环；下个周期完整重做（在线 IP 是
-//	   状态而非增量，重做幂等且不丢数据）。
+//	a) 某个 email 拉 IPs 失败：返回错误中断本次循环；下个周期完整重做（在
+//	   线 IP 是状态而非增量，重做幂等且不丢数据）。v0.5.x 时代的"逐个跳过
+//	   失败 email"已被移除——失败信号必须显式可见，而不是被静默吞掉。
+//	b) PushAlive 失败：返回错误中断本次循环；语义同上。
 //
-// v0.5.2 关键修复：Xboard 端"在线设备"永远 0 的根因。
+// v0.6 关键变更：移除 placeholder IP 兜底
 //
-// 表现：v0.5.1 修复后 traffic_sync 已能正常上报真实流量，但 Xboard 用户管理
-// 页"在线设备"列、节点详情"在线设备数"始终为 0；运维肉眼可见有用户在线，
-// alive_sync 日志亦显示"alive 上报完成 user_count=N（N>0）"——但 user_count
-// 其实是 targets 计数，alive map 实际上传的是 `{}`。
+//	v0.5.2 为了让 3x-ui 端 inbound_client_ips 表常常空（运维未启用 LimitIP /
+//	access log / Fail2Ban 时的常态）的部署仍能在 Xboard 后台看到非 0 的
+//	"在线设备"显示，构造了 RFC 5737 TEST-NET-2 段的 placeholder IP（从
+//	email fnv32a hash 推导稳定占位）。这是典型的"失败兜底" / "降级路径"——
+//	它让运维看到的"在线设备 1"与"3x-ui 端 LimitIP 已配置 + access log
+//	可读"两件事产生伪相关，掩盖真正的根因（多数情况下根因是运维未按 3x-ui
+//	文档启用 LimitIP/access log）。
 //
-// 根因链路：
+//	v0.6 起严格遵守"单一正向路径"承诺：GetClientIPs 返回空切片时（即 3x-ui
+//	端确实无该 email 的 IP 记录），该 user 不进入 alive 上报。Xboard 端
+//	自然显示"在线设备=0"——这是数据真相而非伪展示。运维若需真实 IP，应按
+//	3x-ui 官方文档启用 LimitIP + access log（Linux 还需 Fail2Ban）；不再由
+//	中间件构造伪 IP 欺骗 Xboard 端 setDevices。
 //
-//  1. 3x-ui 主线 POST /panel/api/inbounds/clientIps/:email → 内部读
-//     `inbound_client_ips` SQL 表（client_email → ips JSON）。本仓库
-//     internal/xui/client.go GetClientIPs 同样用 POST，与 3x-ui controller
-//     注册的 POST 路由一致。
-//  2. 该表的填充由 web/job/check_client_ip_job.go 的 CheckClientIpJob.Run()
-//     负责，触发条件四重门槛全部满足才进入 processLogFile → addInboundClientIps：
-//     a) hasLimitIp() == true：至少有一个 client.LimitIP > 0；
-//     b) isAccessLogAvailable == true：xray access log 路径可读；
-//     c) Linux 下需安装 Fail2Ban；Windows 不需要；
-//     d) 实际有流量经过 access log（否则正则匹不到）。
-//  3. 中间件 ClientSettings.LimitIP = Xboard User.DeviceLimit（见
-//     internal/protocol/protocols.go 各协议适配器），但多数 Xboard 部署
-//     的用户 device_limit 默认 0（"不限设备数"），故 a) 通常不满足；即便
-//     运维给少数用户配了 device_limit>0，xray access log 与 Linux 端
-//     Fail2Ban 在常见部署中也未启用——条件 (b)/(c)/(d) 同样常常缺一；
-//  4. → CheckClientIpJob 不进入 IP 解析分支 → 表对中间件 client 几乎永远空；
-//  5. → GetClientIPs 永远返回 "No IP Record"（controller 的 ips=="" 分支），
-//     extractIPs 结果为空切片；
-//  6. → alive map 中所有 user_id 对应的 ips 都是 [] → 拼装阶段被
-//     `len(r.ips) == 0` 跳过 → AliveMap 实际为空对象；
-//  7. → POST /api/v2/server/alive {} → Xboard 端 processAlive 看到 $alive=[]，
-//     foreach 不执行 → user_devices Redis hash 无更新 → online_count
-//     字段不被刷新，永远停在 0；
-//  8. → 用户管理页"在线设备"显示 0。
-//
-// 与 v0.5.1 的区别：v0.5.1 修的是 GetClientTrafficsByInboundID 端点签名
-// 错误（错把 inbound id 当 client UUID 用），属于 traffic_sync / alive_sync
-// 第 1 步 myEmails 计算阶段；本 bug 在第 3 步 GetClientIPs 阶段，traffic_sync
-// 不涉及该端点（traffic 走 client_traffics 表，由 xray gRPC stats 直接写，
-// 与 LimitIP / access log 完全无关），因此 v0.5.1 修复后 traffic 显示正常
-// 而 alive 仍 0——两个独立 bug，必须分别修。
-//
-// v0.5.2 修复策略：placeholder IP 兜底
-//
-// 当 GetClientIPs 返回空（即 3x-ui 端未启用 LimitIP/access log，对中间件
-// client 而言是常态而非异常）时，使用 RFC 5737 TEST-NET-2 文档段
-// (198.51.100.0/24) 构造稳定 placeholder IP，仍调 PushAlive 上报。这保证：
-//
-//   - Xboard processAlive 写入 user_devices hash → notifyUpdate 立即更新
-//     users.online_count → "在线设备 = 1" 反映"该 user 在线"；
-//   - 选择 RFC 5737 段：IANA 永久保留为文档示例，公网 / 运营商内网均不会
-//     使用，与真实 IP 0 冲突；
-//   - placeholder = 198.51.100.<fnv32(email) mod 254 + 1>，同 email 始终
-//     生成同一占位 IP，跨周期幂等，跨 inbound 同 user 共享 placeholder
-//     被 array_unique 去重为 1 设备——这是 placeholder 路径的预期上限
-//     语义（"知道在线"，但不能反映真实多设备数）。
-//
-// 已知局限：placeholder 路径下"在线设备"永远 ≤ 1，无法反映同一 user 在多
-// 终端的真实并发数；运维若需真实计数，请按 3x-ui 文档启用 LimitIP +
-// access log（Linux 还需 Fail2Ban）；后续版本会考虑提供"中间件托管 client
-// 自动设 LimitIP=N"开关，让真实 IP 路径在中间件场景下可用，同时保留本
-// placeholder 兜底作为运维零配置默认值。
+//	已废弃函数：placeholderIP / mergeUnique（v0.5.2 引入用于 placeholder
+//	路径）。本文件不再保留它们以避免误导后续维护者认为可以"继续兜底"。
 func (w *bridgeWorker) syncAlive(ctx context.Context) error {
 	// 取本次 tick 的 trace 化 logger（含 loop=alive_sync + trace_id）；
 	// 详见 engine.go runStep 中的 trace_id 注入逻辑。下方 fan-out goroutine
-	// 闭包捕获 log 引用，所有"alive 拉 IP 失败" WARN 与"alive 上报完成"
-	// INFO 共享同一组 attrs。
+	// 闭包捕获 log 引用，所有"alive 拉 IP 失败" 与"alive 上报完成"INFO
+	// 共享同一组 attrs。
 	log := loggerFromCtx(ctx, w.log)
 
 	traffics, err := w.xuiC.GetClientTrafficsByInboundID(ctx, w.cfg.XuiInboundID)
@@ -141,6 +96,12 @@ func (w *bridgeWorker) syncAlive(ctx context.Context) error {
 	}
 
 	// 受限并发地拉每个 email 的当前 IP。
+	//
+	// 错误传播（v0.6 起）：任意一个 GetClientIPs 失败 → 通过 errOnce 抓取
+	// 第一个错误，等所有 goroutine 退出后整体返回；不再"逐个跳过失败 email
+	// 继续"——单一正向路径承诺要求失败显式可见。3x-ui 面板侧通常返回快速
+	// 失败（连接错误 / 5xx），单个 email 的失败极大概率是面板整体异常，
+	// 让本周期整体失败远比"部分上报"友好。
 	const maxConcurrency = 8
 	sem := make(chan struct{}, maxConcurrency)
 
@@ -150,7 +111,11 @@ func (w *bridgeWorker) syncAlive(ctx context.Context) error {
 	}
 	results := make([]ipResult, len(targets))
 
-	var wg stdsync.WaitGroup
+	var (
+		wg      stdsync.WaitGroup
+		errOnce stdsync.Once
+		firstErr error
+	)
 	for i := range targets {
 		wg.Add(1)
 		go func(idx int) {
@@ -164,16 +129,19 @@ func (w *bridgeWorker) syncAlive(ctx context.Context) error {
 			t := targets[idx]
 			raw, err := w.xuiC.GetClientIPs(ctx, t.email)
 			if err != nil {
-				log.Warn("alive 拉 IP 失败", "email", t.email, "err", err)
+				// 一旦任一 email 拉 IP 失败，整体上报视为失败：本周期不
+				// 调 PushAlive，下周期完整重做。捕获首个错误供主 goroutine
+				// 返回；后续 goroutine 仍会执行（让它们正常退出 sem 不
+				// 阻塞），但其结果会被丢弃。
+				errOnce.Do(func() {
+					firstErr = fmt.Errorf("alive 拉 IP %s：%w", t.email, err)
+				})
 				return
 			}
 			ips := extractIPs(raw)
-			if len(ips) == 0 {
-				// 真实 IP 缺失（详见文件头部 v0.5.2 关键修复注释）：使用
-				// RFC 5737 文档段 placeholder 兜底，让 Xboard 端"在线设备"
-				// 至少反映"该 user 在线"。同 email 跨周期幂等同值。
-				ips = []string{placeholderIP(t.email)}
-			}
+			// v0.6 起 ips 为空时不再走 placeholder 兜底——直接保留为
+			// nil 切片，后续 alive 拼装阶段按"无 IP 即不上报该 user"
+			// 的规则处理。
 			results[idx] = ipResult{userID: t.xboardUserID, ips: ips}
 		}(i)
 	}
@@ -182,8 +150,18 @@ func (w *bridgeWorker) syncAlive(ctx context.Context) error {
 		// 外部已取消，不再上报。
 		return ctx.Err()
 	}
+	if firstErr != nil {
+		return firstErr
+	}
 
-	// 拼装 AliveMap：key 是 user_id 字符串。即使一个用户有多个 IP，也按数组上报。
+	// 拼装 AliveMap：key 是 user_id 字符串。
+	//
+	// 跳过条件（v0.6 单一正向路径）：
+	//   - userID == 0：baseline 异常，绝不可能（targets 已经按 baseline
+	//     存在筛选过）；防御性跳过仅作 trip-wire；
+	//   - len(ips) == 0：3x-ui 端确实无该 email 的 IP 记录；该 user 不进
+	//     入本次 alive 上报，Xboard 端将自然显示"该 user 离线"。这不是
+	//     失败兜底——是"无数据则不上报"的客观行为。
 	alive := xboard.AliveMap{}
 	for _, r := range results {
 		if r.userID == 0 || len(r.ips) == 0 {
@@ -225,6 +203,11 @@ func extractIPs(raw []string) []string {
 // mergeUnique 把 b 中的元素合并到 a 中，去重；保留 a 原有顺序，b 中新元素追加在末尾。
 //
 // 不使用 map 是为了保证出现顺序确定（便于日志比对），且 IP 列表通常 < 16 个，O(n^2) 可接受。
+//
+// 当前调用点（alive 拼装）：在多个 IP 来源合并到同一 user_id 时去重——
+// 例如 3x-ui 返回的同 IP 多次（含不同时间戳）会被合并为一条。本函数与
+// v0.5.2 时代的 placeholder 合并语义无关（placeholder 路径已在 v0.6 删除）；
+// 保留只为正常 IP 列表的合并需求。
 func mergeUnique(a, b []string) []string {
 	for _, v := range b {
 		seen := false
@@ -239,50 +222,4 @@ func mergeUnique(a, b []string) []string {
 		}
 	}
 	return a
-}
-
-// placeholderIP 为"已确认在线但 3x-ui 端拿不到真实 IP"的中间件托管 user 构造
-// 一个稳定占位 IP。真实 IP 缺失的根因详见文件头部 v0.5.2 关键修复注释——
-// 简言之：3x-ui 主线 inbound_client_ips 表的填充强依赖 client.LimitIP > 0 +
-// access log + (Linux 下) Fail2Ban；ClientSettings.LimitIP 虽然映射自
-// Xboard User.DeviceLimit，但多数部署 device_limit=0 + access log/Fail2Ban
-// 未启用，故对绝大多数中间件 client 而言 GetClientIPs 返回空是常态。
-//
-// 设计要点：
-//
-//  1. 段位选 RFC 5737 TEST-NET-2 (198.51.100.0/24)：IANA 永久保留为文档
-//     示例段，互联网 / 运营商内网 / RFC 1918 私有段均不会使用，因此
-//     placeholder 与任何真实 IP 都不会发生取值冲突，运维在 Xboard 端看到
-//     该段 IP 即可立即识别为中间件占位（无需查表）。其他保留段如
-//     192.0.2.0/24（TEST-NET-1）、203.0.113.0/24（TEST-NET-3）也满足同
-//     等需求；选 TEST-NET-2 仅为字面更易识别（中间段、数字递增易记）。
-//
-//  2. 主机位由 fnv32a(email) mod 254 + 1 决定：octet 范围限定 1..254，
-//     避开 .0（网络号语义）与 .255（广播位语义），即便部分 Xboard 部署对
-//     特殊 IP 做了过滤也能稳过。fnv32a 选用理由：标准库自带、零分配、
-//     非加密 hash 速度优于 sha/md5；对"email → octet"映射不需要密码学
-//     强度——254 桶下天然存在碰撞（因为我们刻意避开了 .0 与 .255 两个
-//     边缘地址），碰撞结果只是"不同 user 共享同一 placeholder"，但因
-//     Xboard user_devices Redis 按 user_id 分桶
-//     (`user_devices:{userId}` hash)，跨 user 占位 IP 重复不会互相污染。
-//
-//  3. 同 email 始终映射同一 placeholder：保证跨周期幂等——本周期上线、
-//     下周期仍上线时，Xboard 端 setDevices 先 removeNodeDevices(nodeId,
-//     userId) 清旧 entry，再写同一 placeholder，不产生抖动。
-//
-//  4. 同 user 跨多 inbound / 多 node 同时上线：每个 syncAlive 调用是一个
-//     bridge 内独立计算，AliveMap key 为 xboard_user_id。Xboard hash field
-//     是 {nodeId}:{ip}；同 placeholder 在不同 nodeId 下被算作不同 field，
-//     但 getDeviceCount 用 array_unique($ips) 去重——所以"同一 user 跨 N 节点
-//     上线"在 placeholder 路径下仍只算 1 设备。这是 placeholder 路径的
-//     预期上限语义（不能反映真实并发设备数；运维若需真实数请配 LimitIP）。
-//
-// 不引入额外配置项的理由：本函数仅作为"无真实 IP 时的兜底"，其行为对所
-// 有部署都安全且对公网真实 IP 0 干扰，因此默认启用比加 feature flag 更
-// 直接，运维零配置即可看到非 0 的"在线设备"显示，更新体验是单调改善。
-func placeholderIP(email string) string {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(email))
-	octet := int(h.Sum32()%254) + 1 // 1..254：避开 .0 网络号与 .255 广播位
-	return fmt.Sprintf("198.51.100.%d", octet)
 }

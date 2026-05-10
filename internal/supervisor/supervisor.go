@@ -311,12 +311,13 @@ func (s *Supervisor) startEngineLocked(eng *syncengine.Engine) {
 // applyCredsGuard 检查 Xboard / 3x-ui 凭据完整性，必要时清空 cfg.Bridges。
 //
 // 行为：当 enabled bridge 存在但凭据未配齐（xboard.api_host / xboard.token
-// 任一为空，或 xui.api_host / xui.username / xui.password 任一为空）时，
-// 强制把 cfg.Bridges 置为 nil，让引擎装配 0 worker，避免每周期产生大量
-// "无效" 或 "未鉴权" 请求。
+// 任一为空，或 xui.api_host / xui.api_token 任一为空）时，强制把 cfg.Bridges
+// 置为 nil，让引擎装配 0 worker，避免每周期产生大量"无效" 或 "未鉴权" 请求。
 //
 // 返回值：true 表示触发了清空；false 表示无需介入。便于调用方在日志里
-// 区分"按用户配置正常运行"与"被护栏降级到空载"。
+// 区分"按用户配置正常运行"与"被护栏空载"。本"空载"不是失败回退——它
+// 是配置半填阶段对外部请求风暴的硬护栏，与 sync 层的"单一正向路径"承诺
+// 完全正交：sync 层只在凭据填齐后启动正向 worker。
 //
 // 设计动机：M2 阶段把这一逻辑放在 main.go；但 Reload 路径同样需要它，
 // 否则 Web Handler 写入半填配置后引擎会装配 worker 然后猛刷无效请求。
@@ -329,8 +330,8 @@ func (s *Supervisor) startEngineLocked(eng *syncengine.Engine) {
 func applyCredsGuard(cfg *config.Root, log *slog.Logger) bool {
 	// 委托给 cfg.{Xboard,Xui}.CredsComplete()——同一份函数在
 	// internal/web/status_handler.go 也使用，杜绝运维看到的"凭据完整性"灯
-	// 与引擎实际行为不一致。v0.4 起 xui 仅 cookie 登录模式，CredsComplete
-	// 检查 APIHost + Username + Password 三必填。
+	// 与引擎实际行为不一致。v0.6 起 xui 仅 Bearer API Token 单通道，
+	// CredsComplete 检查 APIHost + APIToken 两必填。
 	xboardOK := cfg.Xboard.CredsComplete()
 	xuiOK := cfg.Xui.CredsComplete()
 	if xboardOK && xuiOK {

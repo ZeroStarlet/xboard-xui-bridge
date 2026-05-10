@@ -33,7 +33,7 @@
 | **零侵入** | 仅通过两边公开的 HTTP API 交互；不改任何源码、不在节点机部署额外进程 |
 | **零 yaml** | 配置全部维护于 SQLite + Web GUI，浏览器登录即可增删桥接 |
 | **运行期热重载** | Supervisor 在 settings/bridges 修改后全停全启同步引擎，无需重启进程 |
-| **高可靠遥测** | 差量上报 + 本地 SQLite 持久化基线 + 失败重传 + 重置补偿 + **心跳保活**（v0.5）；通过 `last_seen + pending` 在重置/失败叠加场景下避免流量丢失，通过 `[0, 0]` 占位心跳降低节点被误标"无人使用或异常"的概率（详见限制与边界） |
+| **高可靠遥测** | 差量上报 + 本地 SQLite 持久化基线 + 失败重传 + 重置补偿；通过 `last_seen + pending` 在重置 / 失败叠加场景下避免流量丢失。v0.6 起严格遵守"单一正向路径"承诺：无真实差量则不 push，不再发送 `[0, 0]` 占位心跳维持节点状态——空闲节点交给 Xboard 端按其原生判定逻辑显示 `STATUS_ONLINE_NO_PUSH`，让运维看到的状态等于真实数据 |
 | **多桥接** | 单实例可承载多组 (Xboard 节点 ↔ 3x-ui inbound) 映射，互不干扰 |
 | **单二进制** | `go build` 后约 25 MB（含 Vue 前端），无 cgo / 无系统级 SQLite 依赖 |
 | **Web 面板** | Vue 3 + Tailwind 单页应用，bcrypt + Session Cookie 鉴权，CSRF 防御内置 |
@@ -56,7 +56,7 @@
                   │ │ Supervisor       │ │ 引擎热重载控制器
                   │ │ ┌──────────────┐ │ │
                   │ │ │ user_sync    │ │ │ 拉用户 → diff → addClient/del
-                  │ │ │ traffic_sync │ │ │ 拉流量 → 差量 → push (+心跳)
+                  │ │ │ traffic_sync │ │ │ 拉流量 → 差量 → push（无差量不 push）
                   │ │ │ alive_sync   │ │ │ 拉在线 IP → push
                   │ │ │ status_sync  │ │ │ 拉节点状态 → push
                   │ │ └──────────────┘ │ │
@@ -65,7 +65,7 @@
                   │                      │   admin_users / sessions /
                   │                      │   traffic_baseline
                   └──────────┬───────────┘
-                             │  HTTP（cookie 登录鉴权）
+                             │  HTTP（Bearer API Token 鉴权）
                     ┌────────┴────────────┐
                     │   3x-ui 面板        │
                     │ /panel/api/...      │
@@ -142,7 +142,7 @@ xui-bridge help                 # 完整帮助
 | 系统 | 准备项 |
 | --- | --- |
 | **Xboard** | 在系统设置中拿到 `server_token`；为该节点分配数字 ID。 |
-| **3x-ui** | 准备 3x-ui 后台用户名 + 密码（v0.4 起统一用 cookie 登录，主线与 fork 都同等支持）；在该节点机预创建 inbound 拿到数字 ID。如启用了 TOTP 2FA，另外提供该账户绑定的 base32 secret。 |
+| **3x-ui** | **必须使用 v3.0.0 或更新版本**。在 3x-ui 后台「面板设置 → API 令牌」点击「重新生成」拿到 48 字符 API Token；在该节点机预创建 inbound 拿到数字 ID。v0.6 起本中间件仅支持 Bearer Token 鉴权，账号密码 / cookie / TOTP 路径已彻底移除——v3.0.0 之前的 3x-ui 版本不再兼容。 |
 | **Xboard 队列** | **必须** 运行 `php artisan queue:work` 或 Horizon——Xboard 端真正写库的是 `TrafficFetchJob` 异步队列任务，不跑 worker 的话中间件 push 永远成功但用户 u/d 永远 0（详见"限制与边界"）。 |
 
 ### 首次登录
@@ -289,13 +289,29 @@ v0.1 通过 `config.yaml` 维护配置；v0.2 起完全废弃 yaml，迁移到 S
 
 完整支持需要中间件解析 inbound 协议级配置，违背了"协议字段真相源在 3x-ui"的约定。当前选择：让运维在使用 Shadowsocks 时**避开 2022 算法**（使用 aes-256-gcm 等），由 3x-ui 端配置 method、客户端 password 直接使用 uuid。后续若有需求，可在 `internal/protocol/protocols.go` 的 `shadowsocksAdapter` 中扩展。
 
-### 为什么 traffic_sync 在无差量时也发心跳 push？（v0.5 新增）
+### 为什么 v0.6 不再发送无差量的 [0,0] 心跳 push？
 
-Xboard 节点状态判定（`Server::getAvailableStatusAttribute`）的硬规则：5 分钟内必须有真正的 push 进入 `processTraffic` 主流程才能保持 `STATUS_ONLINE`，否则节点变 `STATUS_ONLINE_NO_PUSH`，前端展示为"无人使用或异常"。而 `processTraffic` 在 `array_filter` 后 `empty($data)` 时直接 return **不更新缓存**——发空 push 等于没发。
+v0.5 时代为了避免节点在"5 分钟内无真实流量"时被 Xboard 端
+`Server::getAvailableStatusAttribute` 判定为 `STATUS_ONLINE_NO_PUSH`（前端
+展示为"无人使用或异常"），曾从 baseline 中任选一个有效 user_id 构造
+`{"<id>": [0, 0]}` 占位 push 维持 `STATUS_ONLINE`。这是典型的"失败兜底" /
+"降级路径"——它让上层观察者无法区分"节点真的有人在用 + 有差量"与"节点
+空闲 + 中间件伪装在上报"两种状态，且额外消耗 Xboard 的 `array_filter` /
+`Cache::put` 开销。
 
-v0.4 之前的 traffic_sync 在 pushPayload 为空时跳过整个 PushTraffic 调用，节点 5 分钟无任何用户产生流量就会被错标"异常"。老版本一度把保活责任错误归因于 status 子循环上报的 `/status` 端点，**那是错的**——`/status` 端点只刷新 `LAST_LOAD_AT` 缓存（节点负载快照），与节点 `available_status` 判定完全无关。
+v0.6 起严格遵守"单一正向路径"承诺：本周期无任何真实差量 → 不调
+`PushTraffic`、直接返回 nil；让 Xboard 按其原生判定逻辑切换节点状态。
+对运维的影响：完全空闲（无用户 / 用户无流量）的节点会显示为
+`STATUS_ONLINE_NO_PUSH`——这是**真实状态**而非异常。运维若关心节点活跃
+显示，应通过：
 
-v0.5 修复：当 pushPayload 为空时，从 baseline 中任选一个有效 user_id 构造 `{"<id>": [0, 0]}` 占位 push——`is_numeric(0)` 通过 `array_filter`，`processTraffic` 走完缓存更新分支刷新 `LAST_PUSH_AT`，后续 `incrementEach(['u'=>0,'d'=>0])` 在 SQL 层是 noop 不污染计费。详见 [`internal/sync/traffic_sync.go`](internal/sync/traffic_sync.go) 文件头注释。
+- 启用 status 子循环（`reporting.status_enabled = true`）维持
+  `LAST_LOAD_AT` 活跃（仅刷新负载条，与 `available_status` 判定无关，
+  但运维肉眼能看到节点心跳）；
+- 让节点真正有用户产生流量（生产环境最自然的活跃信号）；
+
+详见 [`internal/sync/traffic_sync.go`](internal/sync/traffic_sync.go) 文件
+头注释关于 v0.6 移除 [0,0] 心跳兜底的设计动机。
 
 ---
 
@@ -316,8 +332,8 @@ v0.5 修复：当 pushPayload 为空时，从 baseline 中任选一个有效 use
 - **Xboard 队列 worker 必须运行**：Xboard 端 `UniProxyController::push` 把流量交给 `TrafficFetchJob` 异步队列任务真正写库——**必须运行 `php artisan queue:work` 或 Horizon** 才会消费队列；否则中间件 push 永远成功但 Xboard 用户 u/d 字段永远 0。这是 Xboard 部署侧硬性要求，不在中间件可控范围内。
 - **`Push` 端点缺少 idempotency key**：Xboard `/api/v2/server/push` 当前不接受幂等键。极小概率下"push 成功但本地 baseline 写入失败"会导致单次重复计费；该窗口的概率约等于本地 SQLite 单次写失败率（接近 0）。彻底消除需要 Xboard 端在协议层引入 idempotency key，超出中间件单方可控的范围。**流量丢失方向已通过 `last_seen + pending` 字段得到根除**（重置 + push 失败叠加场景下也不会丢失）。
 - **alive 上报性能**：`GetClientIPs` 是逐 email 串行接口；inbound 内在线用户多时延迟显著（已限并发 8 路）。
-- **3x-ui 鉴权（v0.4 起仅 cookie 登录模式）**：填 `xui.api_host` + `xui.username` + `xui.password`，中间件 POST `/login` 拿 session cookie，后续 panel API 调用自动带；遇到失效（401 / 302 / HTML 登录页 / `success=false` 含登录关键字）会自动重登录并重试一次。若 3x-ui 后台启用了 TOTP 2FA，可选填 `xui.totp_secret`（base32），中间件按 RFC 6238 算 6 位码塞 `twoFactorCode`。**Bearer Token 模式（v0.2/v0.3）已彻底移除**——主线与 fork 在浏览器后台都同等支持 `/login` 表单，统一为唯一鉴权方式让代码体积、Web 表单分支、运维心智三方面都简化。从 v0.2/v0.3 升级的运维必须重新填写账号密码。
-- **3x-ui cookie 会话生命周期**：中间件持有 cookie 直到 3x-ui 端 session 失效（默认约 1 小时），失效后自动重登录。已知风险：a) 若 3x-ui 启用 CSRF middleware 且对 `/panel/api/*` 也强制 X-CSRF-Token，cookie 模式可能被拒（403）；当前实现按"无 CSRF"假设发请求，遇到 403 + CSRF 错误信息再扩展。b) 密码以明文存于 settings 表（admin 鉴权后可读），运维需保护好 `bridge.db`（默认 0600）。c) TOTP 模式要求中间件主机与 3x-ui 主机系统时钟相差小于 30 秒（NTP 同步），裸跑容器请挂宿主时钟。
+- **3x-ui 鉴权（v0.6 起仅 Bearer API Token 单通道，仅适配 3x-ui v3.0.0+）**：填 `xui.api_host` + `xui.api_token`，中间件每次面板 API 请求都注入 `Authorization: Bearer <token>` 头；3x-ui 内 `APIController.checkAPIAuth` 走 `MatchApiToken` 通道并让 `CSRFMiddleware` 短路。无登录、无 CSRF、无 cookie，与 cookie 寿命完全解耦。任何 4xx / 5xx / 网络错误立即向上传播，不在客户端层做重试 / 重登录 / 兜底——这是项目"单一正向路径"承诺的具体落实。**账号密码 / cookie / CSRF / TOTP 路径已彻底移除**：从 v0.4/v0.5 升级的运维必须先把 3x-ui 升级到 v3.0.0 或更新版本，并在 3x-ui 后台「面板设置 → API 令牌」生成 token 后填入本中间件 Web 面板。
+- **API Token 安全注意事项**：a) Token 以明文存于 settings 表（admin 鉴权后可读），运维需保护好 `bridge.db`（默认 0600）。b) 在 3x-ui 后台点击「重新生成」会立即让旧 token 失效，运维必须同步更新到本中间件 Web 面板，否则下一次同步循环立刻报错（错误显式可见，没有"自动重试 + 假装在跑"的兜底）。
 - **启动期定型字段**：`log.*` 与 `web.*` 在进程启动时被消费一次；运行期 PATCH 会被 Web Handler 显式拒绝。改监听地址用 `xui-bridge change-listen-addr` 写 systemd drop-in override；其它启动期字段需 `sqlite3 编辑 settings 表后重启`。
 - **删除桥接的清理**：当前删除 bridge 时不会清理对应的 traffic_baseline 行（占用极少，<1KB / 用户）；后续版本计划增加 `store.DeleteBaselinesByBridge` 一次性清理。
 
@@ -335,7 +351,7 @@ v0.5 修复：当 pushPayload 为空时，从 baseline 中任选一个有效 use
 │   ├── protocol/                # 6 个协议适配器（VLESS / VMess / Trojan / SS / Hysteria v1/v2）
 │   ├── store/                   # SQLite 持久层（5 张表：traffic_baseline / settings / bridges / admin_users / sessions）
 │   ├── supervisor/              # 引擎热重载控制器（全停全启 + draining 槽位）
-│   ├── sync/                    # 同步引擎 + 4 类周期 worker（含心跳保活）
+│   ├── sync/                    # 同步引擎 + 4 类周期 worker（v0.6 起单一正向路径，不再有心跳/降级兜底）
 │   ├── web/                     # HTTP 路由 + handlers + go:embed dist
 │   ├── xboard/                  # Xboard /api/v2/server/* 客户端
 │   └── xui/                     # 3x-ui /panel/api/inbounds/* 客户端

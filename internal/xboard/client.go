@@ -52,7 +52,7 @@ func New(cfg config.Xboard) *Client {
 		// host，但中间件在多 bridge 部署下会并发把 4 类同步循环对齐到该
 		// host（4 bridges × 4 loops = 16 并发），叠加同周期偶发的运维操作
 		// （Web Reload 触发的 LoadFromStore 不走该 transport，但 alive 端
-		// 上报与 traffic 心跳/差量 push 仍可能瞬时叠加）。MaxConnsPerHost=32
+		// 上报与 traffic 差量 push 仍可能瞬时叠加）。MaxConnsPerHost=32
 		// 给典型部署留 2× 头空间，避免任意单条卡住的请求把后续所有 RPC
 		// 排队等到 httpClient.Timeout——队列等待计入端到端超时，会让本
 		// 周期连环 fail。显式锁定上限同时阻断"连接风暴 → ephemeral 端口
@@ -122,11 +122,16 @@ func (c *Client) FetchUsers(ctx context.Context, nodeID int, nodeType string) (*
 //   - 即使 traffic 为空也会被序列化为 {} 提交；但 Xboard 端 processTraffic 在
 //     array_filter 后 empty($data) 时直接 return **不更新任何缓存**，等价于
 //     "请求白发"。所以发空 traffic 既无业务效果也不维持 LAST_PUSH_AT。
-//   - 节点 STATUS_ONLINE / STATUS_ONLINE_NO_PUSH 切换由 traffic_sync 通过
-//     "[0, 0] 占位项 push" 心跳维持（详见 internal/sync/traffic_sync.go
-//     文件头注释）；status_sync 的 /status 端点只刷新 LAST_LOAD_AT 缓存，
-//     与节点 available_status 判定无关——v0.4 之前老注释一度写"心跳保活
-//     靠 status_sync"，那是错的，已在 v0.5 修正。
+//     v0.6 起 traffic_sync 在无差量时**不会调用本函数**——空 push 既然
+//     无副作用，调用本身就是冗余流量；详见 internal/sync/traffic_sync.go
+//     "v0.6 移除 [0, 0] 心跳兜底"段落。
+//   - 节点 STATUS_ONLINE / STATUS_ONLINE_NO_PUSH 切换完全交给 Xboard 端
+//     原生判定逻辑：5 分钟内无真实流量即 STATUS_ONLINE_NO_PUSH。中间件
+//     不再构造伪 [0, 0] 占位项欺骗判定。status_sync 的 /status 端点只
+//     刷新 LAST_LOAD_AT 缓存（节点负载条），与 available_status 判定无关
+//     ——v0.4 之前老注释一度写"心跳保活靠 status_sync"，那是错的，已在
+//     v0.5 修正；v0.6 进一步移除 traffic_sync 的占位心跳路径，让节点状态
+//     完全反映真实数据。
 //   - 成功语义：HTTP 200 且 body 反序列化得到 {data:true}（Xboard 约定）；
 //     任一不满足都返回 *Error，调用方据此决定是否回退基线。
 func (c *Client) PushTraffic(ctx context.Context, nodeID int, nodeType string, traffic PushTraffic) error {

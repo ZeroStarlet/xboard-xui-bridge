@@ -44,37 +44,22 @@ import (
 //	本次修复一并恢复其能力。详见 internal/xui/client.go
 //	GetClientTrafficsByInboundID 注释。
 //
-// 心跳 push（v0.5 起，修复"无人使用或异常"标黄 bug）：
+// v0.6 关键变更：移除"心跳 [0,0] 占位 push"兜底
 //
-//	Xboard 端 Server 模型 getAvailableStatusAttribute 的判定铁律：
-//	  - last_check_at 在 5 分钟内 + last_push_at 在 5 分钟内 → STATUS_ONLINE
-//	  - last_check_at 在 5 分钟内 + last_push_at 超时   → STATUS_ONLINE_NO_PUSH
-//	  - last_check_at 超时                              → STATUS_OFFLINE
-//	last_push_at 缓存只在 ServerService::processTraffic 主流程被刷新；
-//	而 processTraffic 在 array_filter 后 empty($data) 时直接 return，**不更新缓存**。
-//	即"中间件发空 push（{}）等于没发"。
+//	v0.5 时代为了避免节点在"5 分钟内无任何用户消费流量"时被 Xboard 端
+//	getAvailableStatusAttribute 标记为 STATUS_ONLINE_NO_PUSH（前端展示
+//	"无人使用或异常"），构造 {"<heartbeatUserID>": [0, 0]} 占位 push 维持
+//	节点 STATUS_ONLINE。这是典型的"失败兜底" / "降级路径"——它让上层
+//	观察者无法区分"节点真的有人在用 + 有差量"与"节点空闲 + 中间件伪装在
+//	上报"两种状态，且额外消耗 Xboard 的 array_filter / Cache::put 开销。
 //
-//	老版本（v0.4 之前）的 traffic_sync 在 pushPayload 为空时跳过整个 PushTraffic
-//	调用，节点 5 分钟内若无任何用户产生流量就会被 Xboard 标记为
-//	STATUS_ONLINE_NO_PUSH——前端展示为"无人使用或异常"，与"节点真死了"难以区分。
-//	老注释一度写"心跳保活靠 status_sync 的 /status 上报刷新 LAST_LOAD_AT"——
-//	**这是错的**：LAST_LOAD_AT 与节点 available_status 判定无关，status 端点
-//	缓存的是节点负载快照，与心跳无关。
-//
-//	v0.5 修复：当 pushPayload 为空时，从 baseline 中任选一个有效 user_id
-//	（XboardUserID > 0）构造 {"<id>": [0, 0]} 占位项发出去——
-//	  a) Xboard 端 array_filter 接受 [0, 0]（is_numeric(0) 通过）；
-//	  b) processTraffic 走完缓存更新分支，刷新 LAST_PUSH_AT；
-//	  c) 后续 incrementEach(['u'=>0,'d'=>0]) 在 SQL 层等价 noop——不污染计费。
-//	心跳目标查找两级兜底：
-//	  1. 优先用循环里 RecordSeen 后的 bl.XboardUserID（最新事务快照）；
-//	  2. 循环结束仍未拿到（3x-ui 此刻 inbound 为空 / 全部走 skip 分支）→
-//	     复用函数顶部加载的 baselines 切片快照，挑首个 XboardUserID > 0
-//	     的行（v0.5.3 起从"二次 ListBaselinesByBridge"改为"复用周期初快照"，
-//	     节省一次 DB 往返；陈旧快照的副作用详见 fallback 处注释）。
-//	仅当 baseline 表无任何 XboardUserID > 0 的有效行（即 Xboard 没给该节点
-//	分配任何合法 user）时才跳过；这种情况下 Xboard 视角下"节点无可服务
-//	用户"，标记 STATUS_ONLINE_NO_PUSH 也合理。
+//	v0.6 起严格遵守"单一正向路径"承诺：本周期无任何真实差量 → 不调
+//	PushTraffic、直接返回 nil；让 Xboard 按其原生判定逻辑切换节点状态
+//	（"在线但 5 分钟内无 push" → STATUS_ONLINE_NO_PUSH）。运维若关心节
+//	点活跃显示，应通过：
+//	  - Xboard 后台 status 上报（status_sync 维持 LAST_LOAD_AT 活跃）；
+//	  - 真实用户产生流量（生产环境最自然的活跃信号）；
+//	维持"在线"的展示，而不是依赖中间件构造伪 [0,0] 数据欺骗判定逻辑。
 //
 // 不可消除的边界（与 README "限制与边界" 一致）：
 //
@@ -101,10 +86,9 @@ func (w *bridgeWorker) syncTraffic(ctx context.Context) error {
 	}
 
 	// 一次性加载本 Bridge 的所有 baseline 到内存 map，替代循环里逐 user
-	// 调 GetBaseline。差量上报路径与心跳兜底路径共享同一份快照——
-	// 1000 user 节点单周期 DB 读路径从 N 次逐 user GetBaseline 降到
-	// 1 次批量读取（仍有 N 次 RecordSeen 写事务，但读路径已无 N 次
-	// 往返）。
+	// 调 GetBaseline。1000 user 节点单周期 DB 读路径从 N 次逐 user
+	// GetBaseline 降到 1 次批量读取（仍有 N 次 RecordSeen 写事务，但读
+	// 路径已无 N 次往返）。
 	//
 	// 快照与 RecordSeen 的关系：本 map 是循环开始时刻的快照；RecordSeen
 	// 内部会在事务里重新读 + 写 baseline，因此"map 中数据过时"不影响
@@ -116,10 +100,9 @@ func (w *bridgeWorker) syncTraffic(ctx context.Context) error {
 	// 跳过该 user，下周期补；T0 之后 user_sync 删除的 baseline 仍在
 	// map 中可见 → 仅当删除发生在 RecordSeen 之前才能被 RecordSeen 内部
 	// 防御性零行插入 + XboardUserID<=0 二次防御过滤；若删除发生在
-	// RecordSeen 返回之后，本周期可能仍发出最后一笔 stale delta /
-	// 心跳——这与"用 GetBaseline 单次读取"的旧行为完全等价，即并发
-	// 删除窗口本就是"最多一笔 stale 上报"，不会造成流量丢失或长期
-	// 重复计费。
+	// RecordSeen 返回之后，本周期可能仍发出最后一笔 stale delta；这与
+	// "用 GetBaseline 单次读取"的旧行为完全等价，即并发删除窗口本就是
+	// "最多一笔 stale 上报"，不会造成流量丢失或长期重复计费。
 	baselines, err := w.store.ListBaselinesByBridge(ctx, w.cfg.Name)
 	if err != nil {
 		return fmt.Errorf("批量加载基线：%w", err)
@@ -132,9 +115,6 @@ func (w *bridgeWorker) syncTraffic(ctx context.Context) error {
 	// 步骤 1：构造 (pushPayload, pendingCommits) 两份数据：
 	//   pushPayload    {uid_string: [up, down]} 直接发给 Xboard；
 	//   pendingCommits 在上报成功后批量调 ApplyReportSuccess 推进 reported。
-	//
-	// 同时记录 heartbeatUserID：循环中遇到的第一个有效 XboardUserID（>0），
-	// 用于"无任何真实差量"时构造 [0, 0] 心跳 push 维持节点 STATUS_ONLINE。
 	type curStat struct {
 		email string
 		curUp int64
@@ -142,12 +122,10 @@ func (w *bridgeWorker) syncTraffic(ctx context.Context) error {
 	}
 	pushPayload := xboard.PushTraffic{}
 	var pending []curStat
-	var heartbeatUserID int64
 
 	// 跳过原因细分计数器（v0.5 起从单一 skipped_other 拆出）。
 	// 运维在日志里能直观看到"为什么 reported_users=0"——是 baseline 没建好、
-	// node_id 配错、还是用户根本没产生流量。混在一起的旧日志极难诊断，
-	// 这是 v0.4 版"流量永远 0 + 提示无人使用或异常"工单的主要排查瓶颈。
+	// node_id 配错、还是用户根本没产生流量。混在一起的旧日志极难诊断。
 	skippedEmailInvalid := 0    // email 解析失败 / 非托管前缀
 	skippedNodeMismatch := 0    // email 中的 node_id 与本 bridge 配置不一致（多 bridge 共享 inbound 的边界）
 	skippedBaselineMissing := 0 // baseline 未建立（user_sync 还没跑过 / 失败）
@@ -161,14 +139,21 @@ func (w *bridgeWorker) syncTraffic(ctx context.Context) error {
 		}
 		_, nodeID, perr := protocol.ParseEmail(t.Email)
 		if perr != nil {
-			// email 形态不合规（运维改过、脏数据），既不上报也不报错。
-			log.Warn("流量上报跳过：email 解析失败", "email", t.Email, "err", perr)
-			skippedEmailInvalid++
-			continue
+			// email 已通过 IsManaged（"xboard_" 前缀）但 ParseEmail 失败——
+			// 这是数据腐烂迹象：托管前缀但其余字段（uuid_segment / node_id /
+			// 分隔符）异常。v0.5.x 的"WARN + continue 维持原状"已被删除：
+			// 静默跳过会让流量永远不上报，掩盖真实根因（运维误改 email /
+			// store 写入异常 / 协议升级未完成）。v0.6 起立即报错让运维显式
+			// 可见，与 user_sync.parseExistingManagedClients 同等严格——
+			// 两者对同一类异常输入的处理保持一致。
+			return fmt.Errorf("流量上报：email %q 是托管前缀但 ParseEmail 失败：%w", t.Email, perr)
 		}
 		if nodeID != w.cfg.XboardNodeID {
-			// 同 inbound 下出现属于其它 node 的 email——理论上不应发生。
-			// 跳过避免把流量错误地记账到当前 node 的 user 上。
+			// 同 inbound 下出现属于其它 node 的 email——这是多 bridge 共享
+			// 同一 inbound（不推荐但允许）或同一物理 inbound 被换绑过 node_id
+			// 时的合法情形：跨 node_id 的 email 不属于本 bridge 的 diff 范围，
+			// 必须 continue 避免把流量错记到本 node 的 user 上。这与
+			// parseExistingManagedClients 的同类分支语义对齐。
 			log.Warn("流量上报跳过：node_id 不匹配", "email", t.Email, "expect", w.cfg.XboardNodeID, "got", nodeID)
 			skippedNodeMismatch++
 			continue
@@ -221,28 +206,24 @@ func (w *bridgeWorker) syncTraffic(ctx context.Context) error {
 		// 写出 xboard_user_id=0 的行。第一次防御只挡到了"读到时已是 0"的
 		// 情形——本次再次校验 RecordSeen 返回的 bl.XboardUserID 必须 > 0，
 		// 否则 push 时会发出 "0": [up, down] 污染计费。
-		// 同时把 heartbeatUserID 切换到从 bl（而非 blPre）取——避免读到的旧
-		// 快照在并发删除窗口内成为 push 目标。
 		if bl.XboardUserID <= 0 {
 			log.Warn("流量上报跳过：RecordSeen 后 baseline.XboardUserID 仍非法（疑似并发删除窗口）",
 				"email", t.Email, "xboard_user_id", bl.XboardUserID)
 			skippedUserIDInvalid++
 			continue
 		}
-		// 用 bl（post-RecordSeen 快照）刷新 heartbeatUserID——这是当前事务
-		// 已确认存在且 user_id>0 的最新值，比 blPre 更可靠。
-		if heartbeatUserID == 0 {
-			heartbeatUserID = bl.XboardUserID
-		}
 
-		// 计算未上报差量。reported 已经在 RecordSeen 中（必要时）置 0。
+		// 计算未上报差量。reported 已经在 RecordSeen 中（必要时）置 0；
+		// 因此正常路径下 t.Up >= bl.ReportedUp、t.Down >= bl.ReportedDown
+		// 必然成立（cur < last_seen 的重置场景被 RecordSeen 捕获并把
+		// reported 归零）。若到这里仍出现负值，意味着 store 层事务出现
+		// 了与协议假设冲突的状态——v0.6 单一正向路径承诺要求立即报错让
+		// 运维显式可见，而不是夹紧到 0 静默丢弃异常。
 		baseUp := t.Up - bl.ReportedUp
 		baseDown := t.Down - bl.ReportedDown
-		if baseUp < 0 {
-			baseUp = 0
-		}
-		if baseDown < 0 {
-			baseDown = 0
+		if baseUp < 0 || baseDown < 0 {
+			return fmt.Errorf("流量基线异常 %s：t.Up=%d t.Down=%d ReportedUp=%d ReportedDown=%d（baseUp=%d baseDown=%d 出现负值，store 层事务可能未正确归零 reported）",
+				t.Email, t.Up, t.Down, bl.ReportedUp, bl.ReportedDown, baseUp, baseDown)
 		}
 		// 直接使用 raw delta（字节）。流量倍率由 Xboard 端 v2_server.rate
 		// 在 TrafficFetchJob 中自动乘算（详见 Reporting 注释）；中间件不在
@@ -258,71 +239,24 @@ func (w *bridgeWorker) syncTraffic(ctx context.Context) error {
 		pending = append(pending, curStat{email: t.Email, curUp: t.Up, curDn: t.Down})
 	}
 
-	// 步骤 2：决定本周期是发"真实差量 push"还是"心跳 [0,0] push"。
+	// 步骤 2：仅在有真实差量时调 Xboard /push（v0.6 起移除"心跳 [0,0] 兜底"）。
 	//
-	// 真实差量优先：pushPayload 非空时直接走真实路径，无需心跳——真实数据
-	// 已经能让 Xboard processTraffic 主流程刷新 LAST_PUSH_AT。
-	//
-	// 无真实差量时心跳兜底：构造 {"<heartbeatUserID>": [0, 0]} 让 Xboard 端：
-	//   a) array_filter 接受（is_numeric(0) 为 true）；
-	//   b) Cache::put SERVER_*_LAST_PUSH_AT 触发（节点 STATUS_ONLINE）；
-	//   c) Cache::put SERVER_*_ONLINE_USER 设为 1（"伪在线 1 人"——可接受的
-	//      展示折损：换取节点不显示"异常"）；
-	//   d) UserService::trafficFetch 走 incrementEach(['u'=>0,'d'=>0])——
-	//      Laravel 在 SQL 层把它优化为 noop UPDATE，不影响计费。
-	//
-	// heartbeatUserID==0 兜底：循环里只有"3x-ui 端确实存在的 client + 已建立
-	// baseline 且 user_id>0"才会被记录到 heartbeatUserID。如果 3x-ui 端
-	// 这一刻 inbound 被清空 / clientStats 全是非托管 / 全部走 baseline_missing
-	// 跳过分支，循环结束 heartbeatUserID 仍为 0。但 baseline 表里可能仍有
-	// Xboard 端分配过的 user 行——复用函数顶部加载的 baselines 切片快照
-	// 再挑一个（v0.5.3 起从"二次 ListBaselinesByBridge"改为"复用周期初
-	// 快照"，节省一次 DB 往返；陈旧快照副作用详见 fallback 处注释）。
-	// 这是 v0.5 修复的关键：3x-ui 临时清空（运维换 inbound、面板重启）期间，
-	// 节点不应被 Xboard 标"异常"。
-	//
-	// 仍找不到（baseline 表无任何 XboardUserID > 0 的有效行）时直接跳过
-	// push——此时 Xboard 端该节点本身就没分配任何合法 user，标
-	// STATUS_ONLINE_NO_PUSH 是合理展示。
-	heartbeatOnly := false
+	// pushPayload 为空 → 直接返回 nil 跳过本次 push。Xboard 端会按其原生
+	// 判定逻辑切换节点状态（5 分钟内无 push → STATUS_ONLINE_NO_PUSH）。
+	// 这是符合"单一正向路径"的预期行为：节点空闲就让 Xboard 看到空闲，
+	// 不替它构造虚假的 [0,0] 占位数据。
 	if len(pushPayload) == 0 {
-		if heartbeatUserID == 0 {
-			// 复用函数顶部已加载的 baselines 切片——避免再发一次
-			// ListBaselinesByBridge 查询。陈旧快照的副作用是可控的：
-			//   - T0 后新增的 baseline 不在快照里 → 心跳目标可能漏选，
-			//     但只要快照里至少存在一行 XboardUserID>0 就能成功心跳；
-			//   - T0 后被删的 baseline 仍在快照里 → 选中后 push [0,0]
-			//     给一个已删 user，Xboard 端 incrementEach(0,0) 是 noop
-			//     不污染计费；且下周期 baseline 会随 user_sync 同步消失。
-			// 单周期心跳目标偶尔陈旧不影响节点 STATUS_ONLINE 的总体维持。
-			for _, bl := range baselines {
-				// 与循环内防御一致：仅挑 XboardUserID>0 的行作为心跳目标，
-				// 避免脏的零行污染计费。
-				if bl.XboardUserID > 0 {
-					heartbeatUserID = bl.XboardUserID
-					break
-				}
-			}
-		}
-		if heartbeatUserID > 0 {
-			pushPayload.Set(heartbeatUserID, 0, 0)
-			heartbeatOnly = true
-		} else {
-			log.Info("无差量也无可用 baseline，跳过本周期 push（Xboard 端无可服务用户）",
-				"skipped_email_invalid", skippedEmailInvalid,
-				"skipped_node_mismatch", skippedNodeMismatch,
-				"skipped_baseline_missing", skippedBaselineMissing,
-				"skipped_user_id_invalid", skippedUserIDInvalid,
-				"skipped_zero", skippedZero,
-			)
-			return nil
-		}
+		log.Info("本周期无差量，跳过 push（v0.6 起不再发送心跳占位）",
+			"skipped_email_invalid", skippedEmailInvalid,
+			"skipped_node_mismatch", skippedNodeMismatch,
+			"skipped_baseline_missing", skippedBaselineMissing,
+			"skipped_user_id_invalid", skippedUserIDInvalid,
+			"skipped_zero", skippedZero,
+		)
+		return nil
 	}
 
-	// 步骤 3：调 Xboard /push。
-	//
-	// 真实差量路径：附带 total_up_bytes / total_down_bytes 让运维确认推送量。
-	// 心跳路径：标记 heartbeat=true，total_bytes 必为 0。
+	// 步骤 3：调 Xboard /push 上报真实差量。
 	totalUp := int64(0)
 	totalDown := int64(0)
 	for _, v := range pushPayload {
@@ -330,7 +264,6 @@ func (w *bridgeWorker) syncTraffic(ctx context.Context) error {
 		totalDown += v[1]
 	}
 	log.Info("调 Xboard /push 上报流量",
-		"heartbeat", heartbeatOnly,
 		"user_count", len(pushPayload),
 		"total_up_bytes", totalUp,
 		"total_down_bytes", totalDown,
@@ -340,26 +273,30 @@ func (w *bridgeWorker) syncTraffic(ctx context.Context) error {
 	}
 
 	// 步骤 4：上报成功，逐条推进 baseline。
-	// 仅推进 pending 中的真实差量项；心跳 [0,0] 不在 pending 中（步骤 1
-	// 仅 deltaUp/deltaDown 非零时才 append），ApplyReportSuccess 不会被对
-	// 心跳 user_id 误调，避免污染该 user 的 reported_*。
 	//
-	// 失败一条不能阻断全部——剩余条目仍要写入，否则会产生"已上报但 baseline 未推进"
-	// 导致下次重复计费。这种情况下记 warn 但不返回错误。
+	// v0.6 单一正向路径承诺：尽量推进所有条目（不能因为第 1 条失败就放弃
+	// 第 2..N 条——那会让大部分用户产生"已上报但 baseline 未推进"的重复
+	// 计费窗口扩大），但只要存在任意一条推进失败，整轮 syncTraffic 必须
+	// 返回错误让上层显式可见。v0.5.x 时代的"WARN 后继续 return nil"已被
+	// 删除——那种行为把"已上报但本地未持久化，下个周期会重复计费一次"
+	// 这一真实风险静默掩盖，违反"失败立即传播"承诺。
+	var firstUpdateErr error
 	updateErrors := 0
 	for _, p := range pending {
 		if err := w.store.ApplyReportSuccess(ctx, w.cfg.Name, p.email, p.curUp, p.curDn); err != nil {
 			updateErrors++
 			log.Warn("推进基线失败（已上报但本地未持久化，下个周期可能重复计费一次）",
 				"email", p.email, "err", err)
+			if firstUpdateErr == nil {
+				firstUpdateErr = fmt.Errorf("推进基线 %s：%w", p.email, err)
+			}
 		}
 	}
 
-	// 完成日志：reported_users 仅计真实差量项（不含心跳）；heartbeat_only
-	// 标志让运维一眼看出本周期是否承担了"维持节点活跃"职责而非真实计费。
+	// 完成日志：reported_users 即真实差量 push 中的用户数。v0.6 起移除
+	// heartbeat_only 标志（不再有伪心跳路径）。
 	log.Info("流量上报完成",
 		"reported_users", len(pending),
-		"heartbeat_only", heartbeatOnly,
 		"total_up_bytes", totalUp,
 		"total_down_bytes", totalDown,
 		"skipped_zero", skippedZero,
@@ -369,5 +306,7 @@ func (w *bridgeWorker) syncTraffic(ctx context.Context) error {
 		"skipped_user_id_invalid", skippedUserIDInvalid,
 		"baseline_update_errors", updateErrors,
 	)
-	return nil
+	// 任意一条 baseline 推进失败都向上传播：上层 runStep 会以 WARN 显示
+	// 完整错误链，运维立刻可见。
+	return firstUpdateErr
 }

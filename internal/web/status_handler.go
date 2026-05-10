@@ -48,8 +48,8 @@ func (s *Server) handleGetStatus(w http.ResponseWriter, r *http.Request) {
 				resp.EnabledBridgeCount++
 			}
 		}
-		// 委托给 config.{Xboard,Xui}.CredsComplete()——v0.4 起 xui 仅 cookie
-		// 登录模式，CredsComplete 检查 api_host + username + password 三必填。
+		// 委托给 config.{Xboard,Xui}.CredsComplete()——v0.6 起 xui 仅 Bearer
+		// API Token 单通道，CredsComplete 检查 api_host + api_token 两必填。
 		// supervisor.applyCredsGuard 共享同一份函数，确保 Dashboard "凭据
 		// 完整性" 灯与引擎实际是否运行结果一致。
 		resp.CredsComplete = cfg.Xboard.CredsComplete() && cfg.Xui.CredsComplete()

@@ -26,7 +26,6 @@ package config
 
 import (
 	"context"
-	"encoding/base32"
 	"errors"
 	"fmt"
 	"net/url"
@@ -60,31 +59,41 @@ var allowedProtocols = map[string]struct{}{
 	ProtocolHysteria2:   {},
 }
 
-// 3x-ui 鉴权说明：v0.4 起统一为 cookie 登录模式（用户名 + 密码 + 可选 TOTP）。
+// 3x-ui 鉴权说明：v0.6 起仅支持 Bearer API Token 模式，仅适配 3x-ui v3.0.0+。
 //
 // 背景演进：
 //
 //	v0.2  仅支持 Bearer Token——主线 3x-ui v2.4+ 在面板设置中可生成 48 字符
 //	      API Token，中间件注入 Authorization 头即可。
-//	v0.3  增设 cookie 模式覆盖 fork 版本不实现 apiToken 中间件的部署
-//	      （`strings $(which x-ui) | grep -ic apitoken == 0`）。
-//	v0.4  彻底砍掉 token 模式：主线与 fork 在浏览器后台都同等支持
-//	      `/login` 表单 + session cookie 路径，统一为唯一鉴权方式让代码体积、
-//	      Web 表单分支、运维心智三方面都简化。Bearer Token 不再支持——
-//	      旧 v0.2/v0.3 token 用户升级 v0.4 后必须重新填写 3x-ui 后台用户名
-//	      / 密码（settings 表里残留的 xui.api_token / xui.auth_mode 行无害
-//	      保留但被 LoadFromStore 忽略；如需清理可手工 sqlite3 删除）。
+//	v0.3  增设 cookie 模式覆盖 fork 版本不实现 apiToken 中间件的部署。
+//	v0.4  统一为 cookie 登录模式：cookie + /login 表单。
+//	v0.6  彻底回到 Bearer Token 唯一通道，仅适配 3x-ui v3.0.0+。
+//	      触发原因：3x-ui v3.0.0 重新设计了鉴权链路——所有 /login 与
+//	      mutating API 强制 CSRF 校验（web/middleware/security.go:
+//	      CSRFMiddleware），同时官方 SettingService.GetApiToken /
+//	      RegenerateApiToken 提供 48 字符随机 Token；MatchApiToken 走
+//	      Authorization: Bearer 通道并让 CSRFMiddleware 短路
+//	      （c.Set("api_authed", true)）。这是 v3.0.0 下最稳定、可预测、
+//	      与 cookie 寿命完全解耦的鉴权路径，且无需 CSRF 双握手 + 无需
+//	      处理 session 过期，是"单一正向路径"承诺最自然的实现。
 //
-// 鉴权流程（详见 internal/xui/client.go）：
+// 鉴权流程：
 //
-//	1. 首次业务调用前 POST /login 拿 session cookie 存进 cookiejar；
-//	2. 后续 panel API 调用由 net/http 自动带 cookie；
-//	3. 遇到失效信号（401 / 302 / HTML 登录页 / success=false 含登录关键字）
-//	   自动重登录并重试一次；仍失败即返回 *Error 让上层 sync 循环走 WARN
-//	   路径，下个周期再试。
-//	4. 若 3x-ui 后台启用了 TOTP 2FA（v2.4+ 主线 LoginForm.twoFactorCode
-//	   字段），填 xui.totp_secret（base32），中间件按 RFC 6238 算 6 位码
-//	   塞 twoFactorCode；未启用 2FA 时该字段留空。
+//	1. 运维在 3x-ui v3.0.0+ 面板"面板设置 → API 令牌"点击 RegenerateApiToken
+//	   生成 48 字符 token（仅含 [A-Za-z0-9]，由 random.Seq(48) 输出）；
+//	2. 把 token 填入本中间件 Web 面板的 xui.api_token；
+//	3. 中间件每次面板 API 请求都注入 "Authorization: Bearer <token>"；
+//	4. 3x-ui 内 APIController.checkAPIAuth → MatchApiToken（constant-time
+//	   compare）→ c.Set("api_authed", true)，CSRFMiddleware 立即短路。
+//
+// 单一正向路径承诺：
+//
+//	a) 任何 4xx / 5xx / 网络错误都立即向上传播为 *xui.Error；中间件不做
+//	   隐式重试 / 重登录 / 兜底响应；
+//	b) Token 错误（401 / 404）= 运维在 3x-ui 面板重新生成 token 后未同步到
+//	   本中间件——立即报错让运维显式介入，不替运维"假装在跑"；
+//	c) 不再支持账号密码 / cookie / CSRF / TOTP——3x-ui v3.0.0 之前的部署
+//	   不再兼容。运维若仍跑老版本，需先升级到 v3.0.0+ 才能使用本中间件。
 
 // settings 表 key 常量。
 //
@@ -107,18 +116,20 @@ const (
 	SettingXboardSkipTLSVerify = "xboard.skip_tls_verify"
 	SettingXboardUserAgent     = "xboard.user_agent"
 
-	// xui 组（v0.4 起仅 cookie 模式；token 相关 SettingXuiAuthMode /
-	// SettingXuiAPIToken 已废弃并从代码中移除——旧 settings 表里残留的
-	// 这两行 KV 无害保留但被 LoadFromStore 忽略）。
+	// xui 组（v0.6 起仅 Bearer API Token 模式，仅适配 3x-ui v3.0.0+）。
+	//
+	// 升级路径：从 v0.4/v0.5 的账号密码（cookie）模式升级时，settings 表中
+	// 残留的 xui.username / xui.password / xui.totp_secret / xui.auth_mode
+	// 行无害保留但 LoadFromStore 不再读取——它们已不参与运行时鉴权。运维
+	// 若想清理可手工执行 sqlite3 ./data/bridge.db
+	// "DELETE FROM settings WHERE key IN ('xui.username','xui.password',
+	//  'xui.totp_secret','xui.auth_mode');"
 	SettingXuiAPIHost  = "xui.api_host"
 	SettingXuiBasePath = "xui.base_path"
-	// Username / Password 必须同时填写或同时留空——半填会被 Validate 拒绝，
-	// 防止"只配了一半凭据"导致中间件持续 login 失败却看似在跑。
-	SettingXuiUsername = "xui.username"
-	SettingXuiPassword = "xui.password"
-	// TOTPSecret 始终可选：仅在 3x-ui 后台启用了 TOTP 2FA 时填写。
-	// 接受大小写不敏感的 base32 字符串（带或不带 = padding 都可）。
-	SettingXuiTOTPSecret    = "xui.totp_secret"
+	// APIToken：3x-ui v3.0.0+ 面板"面板设置 → API 令牌"RegenerateApiToken
+	// 输出的 48 字符随机串。明文存于 settings 表（与 v0.2/v0.3 同等敏感），
+	// admin 鉴权后可通过 Web 面板查看；运维需保护好 bridge.db（默认 0600）。
+	SettingXuiAPIToken      = "xui.api_token"
 	SettingXuiTimeoutSec    = "xui.timeout_sec"
 	SettingXuiSkipTLSVerify = "xui.skip_tls_verify"
 
@@ -206,27 +217,21 @@ type Xboard struct {
 
 // Xui 描述对 3x-ui 面板 API 的访问参数。
 //
-// v0.4 起仅支持 cookie 登录模式：中间件 POST /login 拿 session cookie，
-// 后续 panel API 调用由 net/http cookiejar 自动带 cookie。Bearer Token
-// 模式（v0.2/v0.3）已彻底移除——详见文件顶部"3x-ui 鉴权说明"注释块。
+// v0.6 起仅 Bearer API Token 单通道（仅适配 3x-ui v3.0.0+）；账号密码 /
+// cookie / CSRF / TOTP 路径已彻底移除——详见文件顶部"3x-ui 鉴权说明"
+// 注释块。
 type Xui struct {
 	// APIHost：3x-ui 面板根 URL（含协议头），例如 http://127.0.0.1:2053。
 	APIHost string
 	// BasePath：3x-ui 的 webBasePath 设置；空串代表 /。
 	// 中间件会在 APIHost 之后、/panel/api/... 之前拼接它。
 	BasePath string
-	// Username：3x-ui 后台登录用户名。
-	// 必须与 Password 同时填写或同时留空（半填触发 Validate 报错）；
-	// 全空允许 = 首次启动空载等待 Web 面板填配置。
-	Username string
-	// Password：3x-ui 后台登录密码。
-	// 明文存于 settings 表，admin 鉴权后可通过 Web 面板查看——
-	// 运维需保护好 bridge.db（默认 0600）。
-	Password string
-	// TOTPSecret：3x-ui 后台账户绑定的 TOTP base32 secret；仅在 3x-ui
-	// 启用了 2FA 时填写，留空表示未启用 2FA（默认情形）。
-	// 中间件每次 /login 时按 RFC 6238 算当前 6 位码塞进 twoFactorCode 字段。
-	TOTPSecret string
+
+	// APIToken：3x-ui v3.0.0+ 面板"面板设置 → API 令牌"RegenerateApiToken
+	// 输出的 48 字符随机串。允许为空 = 首次启动空载等待 Web 面板填配置；
+	// 非空时按 validateAPITokenShape 做轻量字符集校验（拒绝粘贴脏数据）。
+	APIToken string
+
 	// TimeoutSec：单次 HTTP 请求超时秒数。
 	TimeoutSec int
 	// SkipTLSVerify：3x-ui 多数部署在 127.0.0.1，但少数会暴露到公网，
@@ -344,16 +349,12 @@ func LoadFromStore(ctx context.Context, st store.Store, dbPath string) (*Root, e
 			UserAgent:     settings[SettingXboardUserAgent],
 		},
 		Xui: Xui{
-			// 注：旧 v0.2/v0.3 settings 表里残留的 xui.auth_mode /
-			// xui.api_token 行此处不再读——v0.4 已彻底移除 token 模式；
-			// 残留 KV 无害保留但被 LoadFromStore 忽略。运维若想清理可
-			// 手工执行 sqlite3 ./data/bridge.db "DELETE FROM settings
-			// WHERE key IN ('xui.auth_mode','xui.api_token');"
+			// 注：v0.4/v0.5 settings 表里残留的 xui.username / xui.password
+			// / xui.totp_secret / xui.auth_mode 行此处不再读——v0.6 已彻底
+			// 移除账号密码模式；残留 KV 无害保留但被 LoadFromStore 忽略。
 			APIHost:       settings[SettingXuiAPIHost],
 			BasePath:      settings[SettingXuiBasePath],
-			Username:      settings[SettingXuiUsername],
-			Password:      settings[SettingXuiPassword],
-			TOTPSecret:    settings[SettingXuiTOTPSecret],
+			APIToken:      settings[SettingXuiAPIToken],
 			TimeoutSec:    parseSettingInt(settings, SettingXuiTimeoutSec, 0),
 			SkipTLSVerify: parseSettingBool(settings, SettingXuiSkipTLSVerify, false),
 		},
@@ -406,10 +407,10 @@ func LoadFromStore(ctx context.Context, st store.Store, dbPath string) (*Root, e
 //   - bridges 数量允许为 0：首次启动 / GUI 还未配置时合法；引擎装配出空集合
 //     并阻塞等待 ctx，Supervisor.Reload 收到新 bridges 后再装配 worker。
 //   - 至少 1 项 enabled 不再强制：运维可临时禁用所有桥接做维护。
-//   - xboard.api_host / xboard.token / xui.api_host / xui.username / xui.password
-//     允许为空：首次启动 GUI 还未填写时合法；非空时仍按原规则校验格式。
-//     xui.username 与 xui.password 必须同时填写或同时留空（半填触发报错），
-//     防止"只配了一半凭据"导致中间件持续登录失败。
+//   - xboard.api_host / xboard.token / xui.api_host / xui.api_token 允许为空：
+//     首次启动 GUI 还未填写时合法；非空时仍按原规则校验格式。
+//     v0.6 起 xui 仅 Bearer API Token 单通道，xui.api_token 非空时按
+//     validateAPITokenShape 做长度 / 字符集轻量校验（拒绝粘贴脏数据）。
 //
 // Web Handler 表单提交路径会做更严格的"必填"校验，这与本函数的宽松校验
 // 互补——前者让用户立刻知道半填错误，后者让运维重启后即使配置不完整也
@@ -460,33 +461,16 @@ func (r *Root) Validate() error {
 	}
 	r.Xui.BasePath = normalizeBasePath(r.Xui.BasePath)
 
-	// 所有凭据字段统一 trim：保留 trim 后的值供持久层回写时不带空格脏数据。
-	r.Xui.Username = strings.TrimSpace(r.Xui.Username)
-	r.Xui.Password = strings.TrimSpace(r.Xui.Password)
-	r.Xui.TOTPSecret = strings.TrimSpace(r.Xui.TOTPSecret)
-
-	// username + password 必须"同时填写"或"同时留空"。半填（仅 username
-	// 或仅 password）会让中间件持续登录失败却看似在跑——必须 fail-fast
-	// 拦截，比静默写库后才在运行期 WARN 友好得多。
-	// 全空允许 = 首次启动空载等待 Web 面板填配置；全填 = 完整凭据。
-	if (r.Xui.Username == "") != (r.Xui.Password == "") {
-		return errors.New("xui.username 与 xui.password 必须同时填写或同时留空（半填会让中间件无法登录 3x-ui）")
-	}
-	// TOTPSecret 始终可选（多数部署不开 2FA）；非空时仅做 base32 合法性
-	// 轻量校验，防止运维把 hex / 普通密码误塞到这里。Google Authenticator
-	// 给的 secret 通常无 = padding，所以走 NoPadding 解码并先剥末尾 =。
-	// ToUpper 是因为 base32 标准编码全大写，但用户从 QR 码下方文本复制时
-	// 可能是小写。
-	if r.Xui.TOTPSecret != "" {
-		cleaned := strings.ToUpper(strings.TrimRight(r.Xui.TOTPSecret, "="))
-		// 边界保护：仅含 = 填充符（如 "===="）的输入剥完会变空串，
-		// 而 base32.DecodeString("") 会静默成功——但这显然是误填。
-		// 这里 fail-fast 给出清晰错误，避免运行期才报"算不出 TOTP"。
-		if cleaned == "" {
-			return errors.New("xui.totp_secret 仅含 = 填充符，不是合法的 base32 secret（请填账户绑定的真实 secret）")
-		}
-		if _, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(cleaned); err != nil {
-			return fmt.Errorf("xui.totp_secret 不是合法的 base32 字符串（请填账户绑定的 base32 secret）：%w", err)
+	// APIToken trim：保留 trim 后的值供持久层回写时不带空格脏数据。
+	r.Xui.APIToken = strings.TrimSpace(r.Xui.APIToken)
+	// 允许为空 = 首次启动空载等待 Web 面板填配置；非空时做长度与字符集
+	// 轻量校验，避免运维把含空白 / 引号的脏数据存进 settings。3x-ui v3.0.0
+	// RegenerateApiToken 用 random.Seq(48) 输出，字符集仅含 [A-Za-z0-9]；
+	// 本中间件只校验"非空格 + 非控制字符 + 长度 ≥ 8"，给将来 3x-ui 改
+	// 字符集留余地，但不接受跨多行 / 含 quote 的明显脏数据。
+	if r.Xui.APIToken != "" {
+		if err := validateAPITokenShape("xui.api_token", r.Xui.APIToken); err != nil {
+			return err
 		}
 	}
 	if r.Xui.TimeoutSec <= 0 {
@@ -603,16 +587,43 @@ func (x Xboard) CredsComplete() bool {
 
 // CredsComplete 判断 3x-ui 鉴权所需的凭据是否填齐。
 //
-// v0.4 起仅 cookie 登录模式：APIHost + Username + Password 任一为空即视为
-// 未配齐。TOTPSecret 不参与判定——多数部署未启用 2FA，强行要求该字段会让
-// "未开 2FA 的部署"永远显示未完整；启用 2FA 但 secret 暂未填的部署，配置
-// 层仍合法（半填严格规则在 Validate 中按 Username/Password 判定，与
-// TOTPSecret 解耦）。
+// v0.6 起仅 Bearer API Token 单通道：APIHost + APIToken 两必填。
 //
-// 仅检查"必填字段非空"语义；与 Validate 不同，本函数不做半填严格 / base32
-// 等格式校验——那些校验已在配置加载阶段完成；运行期判定只关心"够不够发请求"。
+// 仅检查"必填字段非空"语义；与 Validate 不同，本函数不做格式校验——
+// 那些校验已在配置加载阶段完成；运行期判定只关心"够不够发请求"。
+//
+// 调用方：supervisor.applyCredsGuard（半填时强制空载避免无效请求风暴）
+// 与 web.handleStatus（Dashboard "凭据完整性" 灯状态）。两者共用同一函数
+// 杜绝"supervisor 觉得 OK 但 UI 显示未完整"或反向不一致的运维心智负担。
 func (x Xui) CredsComplete() bool {
-	return x.APIHost != "" && x.Username != "" && x.Password != ""
+	return x.APIHost != "" && x.APIToken != ""
+}
+
+// validateAPITokenShape 对用户填入的 3x-ui API Token 做轻量字符集校验。
+//
+// 不严格校验长度（3x-ui v3.0.0 当前是 48 字符随机 ASCII，但未来主线改长度
+// 不应让中间件配置层报错）；只拒绝"含空白字符 / 控制字符 / 非 ASCII"等
+// 明显是脏数据的输入——这些情形 100% 是运维粘贴错误（多行复制、夹带 BOM
+// 或全角字符），与正确 token 区别明显，fail-fast 比写库后运行期 401 友好。
+//
+// 选用 char-by-char 而非正则：标准库已足够；不引入 regexp 包让配置层依赖
+// 最小。
+func validateAPITokenShape(field, raw string) error {
+	if len(raw) < 8 {
+		// < 8 字符的 token 无法对抗任何暴力枚举——3x-ui 主线最短也是 48 字符，
+		// 给一个明显异常下限（8）让填错时立刻报错，而不是 401 后才反查。
+		return fmt.Errorf("%s 长度过短（< 8 字符），疑似填写错误", field)
+	}
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		// ASCII 可打印字符范围 0x21..0x7E；空格 0x20、控制字符 < 0x20、
+		// 非 ASCII >= 0x80 一律拒绝——前两者是粘贴遗留的空白 / 换行；
+		// 后者是用户在中文输入法下误输入全角符号的常见症状。
+		if c <= 0x20 || c >= 0x7F {
+			return fmt.Errorf("%s 含非法字符（位置 %d，字节 0x%02X）；token 应为可打印 ASCII", field, i, c)
+		}
+	}
+	return nil
 }
 
 // validateHTTPHost 检查传入字符串是否为含 scheme 的合法 HTTP/HTTPS URL。

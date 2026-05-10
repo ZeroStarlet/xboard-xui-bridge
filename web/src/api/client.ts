@@ -122,15 +122,14 @@ export interface Bridge {
 export interface Settings {
   log: { level: string; file: string; max_size_mb: number; max_backups: number; max_age_days: number }
   xboard: { api_host: string; token: string; timeout_sec: number; skip_tls_verify: boolean; user_agent: string }
-  // xui v0.4 起仅 cookie 登录模式：username + password（+ 可选 totp_secret）。
-  // Bearer Token 模式（v0.2/v0.3 的 api_token / auth_mode 字段）已彻底移除——
-  // 旧 settings 表里残留行被后端 LoadFromStore 忽略，前端类型也不再暴露。
+  // xui v0.6 起仅 Bearer API Token 单通道（仅适配 3x-ui v3.0.0+）。
+  // 账号密码 / cookie / CSRF / TOTP 路径已彻底移除——旧 settings 表里残留
+  // 的 username / password / totp_secret / auth_mode 行被后端 LoadFromStore
+  // 忽略，前端类型也不再暴露。
   xui: {
     api_host: string
     base_path: string
-    username: string
-    password: string
-    totp_secret: string
+    api_token: string
     timeout_sec: number
     skip_tls_verify: boolean
   }
