@@ -34,16 +34,48 @@ type Client struct {
 // 不再做二次校验，遵循"由谁负责校验，谁的输出可信"的契约。
 func New(cfg config.Xboard) *Client {
 	transport := &http.Transport{
-		// 默认 transport 在 keep-alive 上的池化策略已足够；这里仅在 SkipTLSVerify
-		// 为 true 时构造自定义 TLSClientConfig，避免对全局 http.DefaultTransport
-		// 造成污染。
+		// 不直接复用 http.DefaultTransport 的两个原因：
+		//  1) SkipTLSVerify 必须按 cfg 决定；复用 default 会污染全局；
+		//  2) default 的 ResponseHeaderTimeout=0（无限等响应头），上游 PHP-FPM
+		//     / 反代 worker 在读完 header 前卡死时，单次请求能撑满整个
+		//     httpClient.Timeout（默认 15s）。本 transport 在 IO 各阶段
+		//     设独立超时，让"读 header 前卡死""TLS 握手卡死""100-Continue
+		//     卡死"三类异常各自尽快返回；端到端总上限仍由 httpClient.Timeout
+		//     兜底（含 DNS/TCP dial / 响应体读取阶段，本 transport 不再
+		//     额外约束）。
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: cfg.SkipTLSVerify, //nolint:gosec // 配置允许时由运维显式启用
 			MinVersion:         tls.VersionTLS12,
 		},
+		// 连接池：MaxIdleConns 是全局闲置上限；MaxIdleConnsPerHost 与
+		// MaxConnsPerHost 是按目标 host 细化限制——Xboard 通常只有一个
+		// host，但中间件在多 bridge 部署下会并发把 4 类同步循环对齐到该
+		// host（4 bridges × 4 loops = 16 并发），叠加同周期偶发的运维操作
+		// （Web Reload 触发的 LoadFromStore 不走该 transport，但 alive 端
+		// 上报与 traffic 心跳/差量 push 仍可能瞬时叠加）。MaxConnsPerHost=32
+		// 给典型部署留 2× 头空间，避免任意单条卡住的请求把后续所有 RPC
+		// 排队等到 httpClient.Timeout——队列等待计入端到端超时，会让本
+		// 周期连环 fail。显式锁定上限同时阻断"连接风暴 → ephemeral 端口
+		// 耗尽"边角失败（极端时新连接被 EADDRINUSE 拒绝）。
 		MaxIdleConns:        16,
 		MaxIdleConnsPerHost: 8,
+		MaxConnsPerHost:     32,
 		IdleConnTimeout:     90 * time.Second,
+		// 细粒度超时：仅约束 TLS 握手 / 服务端读完 header / 100-Continue
+		// 三个 IO 子阶段。10s / 10s / 1s 远高于正常 Xboard 响应时间
+		// （< 500ms），远低于默认 client.Timeout=15s。注意：这些超时不
+		// 覆盖 DNS/TCP dial 与响应体读取——后两者仍由 httpClient.Timeout
+		// 端到端兜底。
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		// 显式启用 HTTP/2：当 Transport 设了自定义 TLSClientConfig 时，
+		// Go net/http 会保守地禁用 HTTP/2 自动协商（除非显式置
+		// ForceAttemptHTTP2=true），原因是 stdlib 担心调用方意图绕开
+		// 默认 ALPN 行为。本中间件需要的是"自签证书放行"而非"禁用 h2"，
+		// 故必须显式置 true 才能在 nginx + h2 反代场景下复用单 TCP 流，
+		// 显著降低连接池压力（多个并发 RPC 共享一个 TCP）。
+		ForceAttemptHTTP2: true,
 	}
 	return &Client{
 		baseURL:   cfg.APIHost,

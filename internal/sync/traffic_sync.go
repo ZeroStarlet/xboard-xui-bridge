@@ -2,7 +2,6 @@ package sync
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/protocol"
@@ -70,7 +69,9 @@ import (
 //	心跳目标查找两级兜底：
 //	  1. 优先用循环里 RecordSeen 后的 bl.XboardUserID（最新事务快照）；
 //	  2. 循环结束仍未拿到（3x-ui 此刻 inbound 为空 / 全部走 skip 分支）→
-//	     回退查 ListBaselinesByBridge 挑首个 XboardUserID > 0 的行。
+//	     复用函数顶部加载的 baselines 切片快照，挑首个 XboardUserID > 0
+//	     的行（v0.5.3 起从"二次 ListBaselinesByBridge"改为"复用周期初快照"，
+//	     节省一次 DB 往返；陈旧快照的副作用详见 fallback 处注释）。
 //	仅当 baseline 表无任何 XboardUserID > 0 的有效行（即 Xboard 没给该节点
 //	分配任何合法 user）时才跳过；这种情况下 Xboard 视角下"节点无可服务
 //	用户"，标记 STATUS_ONLINE_NO_PUSH 也合理。
@@ -88,9 +89,44 @@ import (
 //	否则中间件 push 永远成功（200）但 Xboard 用户 u/d 字段永远 0。
 //	该提示已在 README "限制与边界" 章节明确披露。
 func (w *bridgeWorker) syncTraffic(ctx context.Context) error {
+	// 取本次 tick 的 trace 化 logger（含 loop=traffic_sync + trace_id）；
+	// 详见 engine.go runStep 中的 trace_id 注入逻辑。函数内所有 w.log
+	// 调用均已替换为 log，让本周期所有 skipped_* WARN / 推进失败 WARN /
+	// 完成 INFO 共享同一组 attrs。
+	log := loggerFromCtx(ctx, w.log)
+
 	traffics, err := w.xuiC.GetClientTrafficsByInboundID(ctx, w.cfg.XuiInboundID)
 	if err != nil {
 		return fmt.Errorf("拉取 3x-ui 流量：%w", err)
+	}
+
+	// 一次性加载本 Bridge 的所有 baseline 到内存 map，替代循环里逐 user
+	// 调 GetBaseline。差量上报路径与心跳兜底路径共享同一份快照——
+	// 1000 user 节点单周期 DB 读路径从 N 次逐 user GetBaseline 降到
+	// 1 次批量读取（仍有 N 次 RecordSeen 写事务，但读路径已无 N 次
+	// 往返）。
+	//
+	// 快照与 RecordSeen 的关系：本 map 是循环开始时刻的快照；RecordSeen
+	// 内部会在事务里重新读 + 写 baseline，因此"map 中数据过时"不影响
+	// 重置补偿正确性。并发 user_sync 删除窗口仍由后续 bl.XboardUserID
+	// <= 0 二次防御兜底（详见循环中 RecordSeen 后的注释）。
+	//
+	// 快照陈旧的可见窗口：T0（本次 ListBaselinesByBridge）之后 user_sync
+	// 新增的 baseline 在本周期 map 中查不到 → 走 skippedBaselineMissing
+	// 跳过该 user，下周期补；T0 之后 user_sync 删除的 baseline 仍在
+	// map 中可见 → 仅当删除发生在 RecordSeen 之前才能被 RecordSeen 内部
+	// 防御性零行插入 + XboardUserID<=0 二次防御过滤；若删除发生在
+	// RecordSeen 返回之后，本周期可能仍发出最后一笔 stale delta /
+	// 心跳——这与"用 GetBaseline 单次读取"的旧行为完全等价，即并发
+	// 删除窗口本就是"最多一笔 stale 上报"，不会造成流量丢失或长期
+	// 重复计费。
+	baselines, err := w.store.ListBaselinesByBridge(ctx, w.cfg.Name)
+	if err != nil {
+		return fmt.Errorf("批量加载基线：%w", err)
+	}
+	baselineMap := make(map[string]store.Baseline, len(baselines))
+	for _, bl := range baselines {
+		baselineMap[bl.Email] = bl
 	}
 
 	// 步骤 1：构造 (pushPayload, pendingCommits) 两份数据：
@@ -126,14 +162,14 @@ func (w *bridgeWorker) syncTraffic(ctx context.Context) error {
 		_, nodeID, perr := protocol.ParseEmail(t.Email)
 		if perr != nil {
 			// email 形态不合规（运维改过、脏数据），既不上报也不报错。
-			w.log.Warn("流量上报跳过：email 解析失败", "email", t.Email, "err", perr)
+			log.Warn("流量上报跳过：email 解析失败", "email", t.Email, "err", perr)
 			skippedEmailInvalid++
 			continue
 		}
 		if nodeID != w.cfg.XboardNodeID {
 			// 同 inbound 下出现属于其它 node 的 email——理论上不应发生。
 			// 跳过避免把流量错误地记账到当前 node 的 user 上。
-			w.log.Warn("流量上报跳过：node_id 不匹配", "email", t.Email, "expect", w.cfg.XboardNodeID, "got", nodeID)
+			log.Warn("流量上报跳过：node_id 不匹配", "email", t.Email, "expect", w.cfg.XboardNodeID, "got", nodeID)
 			skippedNodeMismatch++
 			continue
 		}
@@ -142,14 +178,16 @@ func (w *bridgeWorker) syncTraffic(ctx context.Context) error {
 		// 的"未注册"语义冲突）。若 baseline 缺失，本周期跳过该 client，下周期 user_sync
 		// 写完即可恢复正常上报；3x-ui 端流量在 baseline 建立前累积的部分会在
 		// RecordSeen 第一次执行时写入 last_seen，下次差量自然包含。
-		blPre, err := w.store.GetBaseline(ctx, w.cfg.Name, t.Email)
-		if errors.Is(err, store.ErrNotFound) {
-			w.log.Debug("流量上报跳过：基线未建立（等待 user_sync）", "email", t.Email)
+		//
+		// map 查询替代逐 user GetBaseline DB 往返："key 不存在"等价于原
+		// errors.Is(err, store.ErrNotFound) 分支语义。批量加载的统一错误
+		// 处理已在函数顶部完成（ListBaselinesByBridge 失败即整个 syncTraffic
+		// return），所以 map 路径下不再需要"读取基线失败"的逐条错误处理。
+		blPre, ok := baselineMap[t.Email]
+		if !ok {
+			log.Debug("流量上报跳过：基线未建立（等待 user_sync）", "email", t.Email)
 			skippedBaselineMissing++
 			continue
-		}
-		if err != nil {
-			return fmt.Errorf("读取基线 %s：%w", t.Email, err)
 		}
 
 		// 早期防御性拦截：baseline.XboardUserID <= 0 不应出现——它意味着
@@ -161,7 +199,7 @@ func (w *bridgeWorker) syncTraffic(ctx context.Context) error {
 		// 覆盖"GetBaseline 后 user_sync 并发删除导致 RecordSeen 写零行"
 		// 的窗口——那一情形由 RecordSeen 之后的二次防御兜底（详见下方）。
 		if blPre.XboardUserID <= 0 {
-			w.log.Warn("流量上报跳过：baseline.XboardUserID 非法（<=0），疑似防御性零行或脏数据",
+			log.Warn("流量上报跳过：baseline.XboardUserID 非法（<=0），疑似防御性零行或脏数据",
 				"email", t.Email, "xboard_user_id", blPre.XboardUserID)
 			skippedUserIDInvalid++
 			continue
@@ -186,7 +224,7 @@ func (w *bridgeWorker) syncTraffic(ctx context.Context) error {
 		// 同时把 heartbeatUserID 切换到从 bl（而非 blPre）取——避免读到的旧
 		// 快照在并发删除窗口内成为 push 目标。
 		if bl.XboardUserID <= 0 {
-			w.log.Warn("流量上报跳过：RecordSeen 后 baseline.XboardUserID 仍非法（疑似并发删除窗口）",
+			log.Warn("流量上报跳过：RecordSeen 后 baseline.XboardUserID 仍非法（疑似并发删除窗口）",
 				"email", t.Email, "xboard_user_id", bl.XboardUserID)
 			skippedUserIDInvalid++
 			continue
@@ -237,7 +275,9 @@ func (w *bridgeWorker) syncTraffic(ctx context.Context) error {
 	// baseline 且 user_id>0"才会被记录到 heartbeatUserID。如果 3x-ui 端
 	// 这一刻 inbound 被清空 / clientStats 全是非托管 / 全部走 baseline_missing
 	// 跳过分支，循环结束 heartbeatUserID 仍为 0。但 baseline 表里可能仍有
-	// Xboard 端分配过的 user 行——回退查 ListBaselinesByBridge 再挑一个。
+	// Xboard 端分配过的 user 行——复用函数顶部加载的 baselines 切片快照
+	// 再挑一个（v0.5.3 起从"二次 ListBaselinesByBridge"改为"复用周期初
+	// 快照"，节省一次 DB 往返；陈旧快照副作用详见 fallback 处注释）。
 	// 这是 v0.5 修复的关键：3x-ui 临时清空（运维换 inbound、面板重启）期间，
 	// 节点不应被 Xboard 标"异常"。
 	//
@@ -247,10 +287,14 @@ func (w *bridgeWorker) syncTraffic(ctx context.Context) error {
 	heartbeatOnly := false
 	if len(pushPayload) == 0 {
 		if heartbeatUserID == 0 {
-			baselines, err := w.store.ListBaselinesByBridge(ctx, w.cfg.Name)
-			if err != nil {
-				return fmt.Errorf("回退查询 baseline 列表（用于心跳兜底）：%w", err)
-			}
+			// 复用函数顶部已加载的 baselines 切片——避免再发一次
+			// ListBaselinesByBridge 查询。陈旧快照的副作用是可控的：
+			//   - T0 后新增的 baseline 不在快照里 → 心跳目标可能漏选，
+			//     但只要快照里至少存在一行 XboardUserID>0 就能成功心跳；
+			//   - T0 后被删的 baseline 仍在快照里 → 选中后 push [0,0]
+			//     给一个已删 user，Xboard 端 incrementEach(0,0) 是 noop
+			//     不污染计费；且下周期 baseline 会随 user_sync 同步消失。
+			// 单周期心跳目标偶尔陈旧不影响节点 STATUS_ONLINE 的总体维持。
 			for _, bl := range baselines {
 				// 与循环内防御一致：仅挑 XboardUserID>0 的行作为心跳目标，
 				// 避免脏的零行污染计费。
@@ -264,7 +308,7 @@ func (w *bridgeWorker) syncTraffic(ctx context.Context) error {
 			pushPayload.Set(heartbeatUserID, 0, 0)
 			heartbeatOnly = true
 		} else {
-			w.log.Info("无差量也无可用 baseline，跳过本周期 push（Xboard 端无可服务用户）",
+			log.Info("无差量也无可用 baseline，跳过本周期 push（Xboard 端无可服务用户）",
 				"skipped_email_invalid", skippedEmailInvalid,
 				"skipped_node_mismatch", skippedNodeMismatch,
 				"skipped_baseline_missing", skippedBaselineMissing,
@@ -285,7 +329,7 @@ func (w *bridgeWorker) syncTraffic(ctx context.Context) error {
 		totalUp += v[0]
 		totalDown += v[1]
 	}
-	w.log.Info("调 Xboard /push 上报流量",
+	log.Info("调 Xboard /push 上报流量",
 		"heartbeat", heartbeatOnly,
 		"user_count", len(pushPayload),
 		"total_up_bytes", totalUp,
@@ -306,14 +350,14 @@ func (w *bridgeWorker) syncTraffic(ctx context.Context) error {
 	for _, p := range pending {
 		if err := w.store.ApplyReportSuccess(ctx, w.cfg.Name, p.email, p.curUp, p.curDn); err != nil {
 			updateErrors++
-			w.log.Warn("推进基线失败（已上报但本地未持久化，下个周期可能重复计费一次）",
+			log.Warn("推进基线失败（已上报但本地未持久化，下个周期可能重复计费一次）",
 				"email", p.email, "err", err)
 		}
 	}
 
 	// 完成日志：reported_users 仅计真实差量项（不含心跳）；heartbeat_only
 	// 标志让运维一眼看出本周期是否承担了"维持节点活跃"职责而非真实计费。
-	w.log.Info("流量上报完成",
+	log.Info("流量上报完成",
 		"reported_users", len(pending),
 		"heartbeat_only", heartbeatOnly,
 		"total_up_bytes", totalUp,

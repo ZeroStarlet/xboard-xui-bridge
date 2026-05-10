@@ -30,6 +30,13 @@ import (
 //	并仅处理仍然不一致的部分，无需补偿动作。这避免了"多步部分成功"导致
 //	的中间状态——下一周期重做即可幂等。
 func (w *bridgeWorker) syncUsers(ctx context.Context) error {
+	// 取本次 tick 的 trace 化 logger（含 loop=user_sync + trace_id）；详见
+	// engine.go runStep 中的 trace_id 注入逻辑。子函数 buildWantedClients /
+	// parseExistingManagedClients / applyXxx 当前不打日志，故只在主入口
+	// 替换 logger；任何错误会通过 fmt.Errorf 链返回 runStep，runStep 层
+	// 的 WARN 输出带 trace_id 自然贯穿。
+	log := loggerFromCtx(ctx, w.log)
+
 	users, err := w.xboardC.FetchUsers(ctx, w.cfg.XboardNodeID, w.cfg.XboardNodeType)
 	if err != nil {
 		return fmt.Errorf("拉取 Xboard 用户：%w", err)
@@ -51,7 +58,7 @@ func (w *bridgeWorker) syncUsers(ctx context.Context) error {
 
 	toAdd, toUpdate, toDelete := diffClients(wanted, existing)
 
-	w.log.Info("用户 diff 完成",
+	log.Info("用户 diff 完成",
 		"xboard_users", len(users.Users),
 		"xui_managed", len(existing),
 		"add", len(toAdd),

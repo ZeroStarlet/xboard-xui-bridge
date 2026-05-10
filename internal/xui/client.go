@@ -41,6 +41,8 @@ import (
 //	   两处读写，访问点都已持锁。
 //	d) baseURL / username / password / totpSecret 等构造后不可变字段无锁；
 //	   它们的读取行为对所有 goroutine 一致。
+//	e) listMu 保护 /list 端点的周期内合并缓存（v0.5.3 起引入），与 loginMu
+//	   独立——两者临界区不嵌套；listMu 仅保护短暂的 cache 状态读写。
 type Client struct {
 	baseURL    string // host + base_path（不含尾 /）
 	username   string
@@ -55,6 +57,46 @@ type Client struct {
 	// 不代表服务端 cookie 一定还有效（cookie 失效仍要靠 sendOnce 探测，
 	// 然后 invalidateSession 把它翻回 false 触发重登录）。
 	loggedIn bool
+
+	// /panel/api/inbounds/list 端点的周期内合并缓存（v0.5.3）。
+	//
+	// 背景：traffic_sync 与 alive_sync 都通过 GetClientTrafficsByInboundID
+	// 间接拉 /list；多 Bridge 部署下每周期对同一 host 重复发相同请求。
+	// 单周期内多次调用走缓存命中；多 goroutine 并发撞上过期 → singleflight
+	// 合并成一次 HTTP，等待者通过 done channel 拿同一份结果。
+	//
+	// listCacheTTL 取 5 秒：远小于默认同步周期 60 秒，避免"上一周期数据
+	// 跨周期使用"导致 user_sync 刚加的新 client 流量被推迟到下周期上报；
+	// 同时仍能让 traffic_sync + alive_sync 在同一周期内（典型间隔 < 1s）
+	// 共享一次拉取。
+	listMu       sync.Mutex
+	listCache    []Inbound          // 上次成功拉取的 inbounds 快照（nil 与空切片均可能为合法成功结果，例如 obj=null）
+	listExpireAt time.Time          // 缓存有效性的真相源；零值或已过 = 缓存无效。listCache 自身不能用作"是否有缓存"的判定依据
+	listInflight *listFetchInflight // 非 nil 表示有 goroutine 正在拉取，等待者订阅 done
+}
+
+// listCacheTTL 是 /list 端点缓存的有效期。详见 Client.listMu 字段注释。
+const listCacheTTL = 5 * time.Second
+
+// listFetchInflight 用于 singleflight：当一个 goroutine 正在拉 /list 时，
+// 后续 caller 阻塞在 done channel 上，全部拿到同一份 result。
+//
+// done 关闭后，result 字段被视为"已经写入完毕"——所有 reader 都安全读取。
+// 写入端必须在 close(done) 之前完成 result 的赋值；本约束由
+// fetchInboundsCached 内部的代码顺序保证（写 result → close(done)）。
+type listFetchInflight struct {
+	done   chan struct{}
+	result listFetchResult
+}
+
+// listFetchResult 是一次 /list 拉取的成功 / 失败状态二选一。
+//
+// 设计成简单结构体而非 (slice, error) 二元组：方便在 listFetchInflight 中
+// 一次性赋值后让 close(done) 之后的读取者拿到一致快照，避免"slice 已写
+// 但 err 还未写"的撕裂窗口。
+type listFetchResult struct {
+	inbounds []Inbound
+	err      error
 }
 
 // New 构造 Client。
@@ -67,13 +109,49 @@ type Client struct {
 // 错误会被 *http.Transport 推迟到首次请求时报告，本函数不主动检测。
 func New(cfg config.Xui) (*Client, error) {
 	transport := &http.Transport{
+		// 不直接复用 http.DefaultTransport 的两个原因：
+		//  1) SkipTLSVerify 必须按 cfg 决定；复用 default 会污染全局；
+		//  2) default 的 ResponseHeaderTimeout=0（无限等响应头），3x-ui 在
+		//     xray 重启 / inbound 重载窗口内可能延迟返回 header，单次请求
+		//     会撑满整个 httpClient.Timeout（默认 15s）。本 transport 在
+		//     IO 各阶段设独立超时，让"读 header 前卡死""TLS 握手卡死"
+		//     "100-Continue 卡死"三类异常各自尽快返回；端到端总上限仍由
+		//     httpClient.Timeout 兜底（含 DNS/TCP dial / 响应体读取阶段，
+		//     本 transport 不再额外约束）。
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: cfg.SkipTLSVerify, //nolint:gosec // 由运维配置显式启用
 			MinVersion:         tls.VersionTLS12,
 		},
+		// 连接池：MaxIdleConns 是全局闲置上限；MaxIdleConnsPerHost 与
+		// MaxConnsPerHost 是按目标 host 细化限制——3x-ui 通常只有一个
+		// host，但中间件在多 bridge 部署下会出现请求叠加：4 bridges × 4
+		// 同步循环 = 16 基础并发，再加 alive_sync 内部 GetClientIPs 的
+		// fan-out（每 bridge 信号量 8）——单周期最坏可达 4 × 8 = 32 个
+		// 同时挂起的 GetClientIPs 请求。MaxConnsPerHost=32 给典型部署留
+		// 头空间，避免单条卡住的请求把后续所有 RPC 排队等到
+		// httpClient.Timeout（队列等待计入端到端超时会让本周期连环 fail）。
+		// 显式锁定上限同时阻断"连接风暴 → ephemeral 端口耗尽"边角失败
+		// （极端下新连接被 EADDRINUSE 拒绝）。
 		MaxIdleConns:        16,
 		MaxIdleConnsPerHost: 8,
+		MaxConnsPerHost:     32,
 		IdleConnTimeout:     90 * time.Second,
+		// 细粒度超时：仅约束 TLS 握手 / 服务端读完 header / 100-Continue
+		// 三个 IO 子阶段。10s / 10s / 1s 远高于正常 3x-ui 响应时间
+		// （< 200ms），远低于默认 client.Timeout=15s。/login 路径同样适用
+		// ——3x-ui 主线 LoginForm 处理 < 50ms，10s ResponseHeaderTimeout
+		// 不会误伤。注意：这些超时不覆盖 DNS/TCP dial 与响应体读取——
+		// 后两者仍由 httpClient.Timeout 端到端兜底。
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		// 显式启用 HTTP/2：当 Transport 设了自定义 TLSClientConfig 时，
+		// Go net/http 会保守地禁用 HTTP/2 自动协商（除非显式置
+		// ForceAttemptHTTP2=true），原因是 stdlib 担心调用方意图绕开
+		// 默认 ALPN 行为。本中间件需要的是"自签证书放行"而非"禁用 h2"，
+		// 故必须显式置 true 才能在 nginx + h2 反代场景下复用单 TCP 流，
+		// 显著降低连接池压力（多个并发 RPC 共享一个 TCP）。
+		ForceAttemptHTTP2: true,
 	}
 
 	// 3x-ui 用 gin sessions 默认 cookie 名 "session" 且 HttpOnly + Path=/，
@@ -197,6 +275,39 @@ func (c *Client) GetInbound(ctx context.Context, id int) (*Inbound, error) {
 //     "inbound 临时缺失"时仍能维持节点 STATUS_ONLINE，而不是直接报错中断）
 //   - 网络 / 鉴权 / 5xx 错误 → 走 c.do 的标准错误链，向调用方传播
 func (c *Client) GetClientTrafficsByInboundID(ctx context.Context, inboundID int) ([]ClientTraffic, error) {
+	// v0.5.3 起改走 fetchInboundsCached：单 Client 实例下，多 Bridge 在同
+	// 一同步周期内对同一 host 的多次调用合并为一次 HTTP，降低对 3x-ui
+	// 面板的压力。详见 Client.listMu 字段与 fetchInboundsCached 注释。
+	inbounds, err := c.fetchInboundsCached(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, ib := range inbounds {
+		if ib.ID == inboundID {
+			// 找到目标 inbound：返回其 ClientStats（已经被 Preload + enrich）。
+			// 切片可能 nil（无 client）——调用方按 nil/empty 处理即可，与
+			// "/list 中找不到目标 inbound"的语义合并是有意为之，详见函数头注释。
+			return ib.ClientStats, nil
+		}
+	}
+	// /list 不含目标 inbound id：返回 nil 切片（与"无 client"等价语义合并）。
+	// 不返回 error 是为了让 traffic_sync 进入心跳兜底维持节点 STATUS_ONLINE，
+	// 避免运维改动 inbound id / 改子账户权限期间节点直接被标"无人使用或异常"。
+	return nil, nil
+}
+
+// fetchInbounds 直接发 GET /panel/api/inbounds/list 并解码 obj 字段。
+//
+// 调用方一般通过 fetchInboundsCached 间接调本函数，由后者负责 TTL 控制
+// 与 singleflight 合并。本函数本身无锁、无缓存——是 fetchInboundsCached
+// 的纯 IO 子步骤。
+//
+// 返回值约定：
+//
+//	a) 服务端 obj=null 或 body 空 → 返回 (nil, nil)；
+//	b) 解码成功 → 返回 inbounds 切片（可能为空切片）；
+//	c) 网络 / 鉴权 / 5xx 错误 → 走 c.do 的标准错误链，向调用方传播。
+func (c *Client) fetchInbounds(ctx context.Context) ([]Inbound, error) {
 	endpoint := "/panel/api/inbounds/list"
 	raw, err := c.do(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -211,18 +322,73 @@ func (c *Client) GetClientTrafficsByInboundID(ctx context.Context, inboundID int
 	if err := json.Unmarshal(raw, &inbounds); err != nil {
 		return nil, fmt.Errorf("解码 %s 响应：%w", endpoint, err)
 	}
-	for _, ib := range inbounds {
-		if ib.ID == inboundID {
-			// 找到目标 inbound：返回其 ClientStats（已经被 Preload + enrich）。
-			// 切片可能 nil（无 client）——调用方按 nil/empty 处理即可，与
-			// "/list 中找不到目标 inbound"的语义合并是有意为之，详见函数头注释。
-			return ib.ClientStats, nil
+	return inbounds, nil
+}
+
+// fetchInboundsCached 是带 TTL + singleflight 的 fetchInbounds 包装。
+//
+// 行为分支：
+//
+//	a) listCache 仍在 TTL 内 → 直接返回缓存切片（同一切片在 reader 间共享，
+//	   调用方不应原地 mutate；当前调用点都是只读遍历，安全）；
+//	b) 已有 goroutine 在拉（listInflight 非 nil）→ 阻塞在其 done channel
+//	   上，等 fetcher 关闭后读取共享 result。等待期间响应 ctx 取消，避免
+//	   引擎退出时被卡住；
+//	c) 否则当前 goroutine 触发新一轮拉取：
+//	    1) 在 listMu 内创建 inflight 句柄、赋给 c.listInflight；
+//	    2) 释放 listMu 后调 fetchInbounds——不持锁，避免阻塞其它 caller；
+//	    3) 拉完后重新拿 listMu，更新 cache（仅 err==nil 时）+ 清 inflight，
+//	       最后写 inflight.result 并 close(done)。
+//
+// 失败语义：fetch 失败时 listCache / listExpireAt 都不更新——保持上一轮
+// 成功结果在剩余 TTL 内仍可命中，下一个 caller 看到 expireAt 已过会触发
+// 新一轮 fetch。这避免了"瞬时网络抖动让缓存被脏数据替换"。
+//
+// ctx 选择：fetcher 用本次"首个 caller"的 ctx。该 caller 提前取消会让
+// fetch 失败、所有 waiter 一起失败——这与"同一引擎所有 worker 共用 ctx
+// 树"的现实一致；引擎退出时所有 worker 也都将退出，无需独立 detach ctx。
+//
+// 并发不变量：c.listInflight 仅在持有 listMu 时被读 / 写；从 nil → 非 nil
+// 与 非 nil → nil 都在 listMu 临界区内完成。fetcher 释放 listMu 期间其它
+// goroutine 看到非 nil inflight 并订阅 done channel；fetcher 拿回 listMu
+// 把 inflight 清空之后再 close(done)——任何已订阅的 waiter 都能正常醒来。
+func (c *Client) fetchInboundsCached(ctx context.Context) ([]Inbound, error) {
+	c.listMu.Lock()
+	if !c.listExpireAt.IsZero() && time.Now().Before(c.listExpireAt) {
+		cached := c.listCache
+		c.listMu.Unlock()
+		return cached, nil
+	}
+	if c.listInflight != nil {
+		inflight := c.listInflight
+		c.listMu.Unlock()
+		select {
+		case <-inflight.done:
+			return inflight.result.inbounds, inflight.result.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
-	// /list 不含目标 inbound id：返回 nil 切片（与"无 client"等价语义合并）。
-	// 不返回 error 是为了让 traffic_sync 进入心跳兜底维持节点 STATUS_ONLINE，
-	// 避免运维改动 inbound id / 改子账户权限期间节点直接被标"无人使用或异常"。
-	return nil, nil
+	// 当前 goroutine 触发拉取。
+	inflight := &listFetchInflight{done: make(chan struct{})}
+	c.listInflight = inflight
+	c.listMu.Unlock()
+
+	inbounds, err := c.fetchInbounds(ctx)
+
+	c.listMu.Lock()
+	if err == nil {
+		c.listCache = inbounds
+		c.listExpireAt = time.Now().Add(listCacheTTL)
+	}
+	c.listInflight = nil
+	c.listMu.Unlock()
+
+	// 写 result 必须在 close(done) 之前完成；close 之后 reader 可立即读 result。
+	inflight.result = listFetchResult{inbounds: inbounds, err: err}
+	close(inflight.done)
+
+	return inbounds, err
 }
 
 // AddClient 调用 POST /panel/api/inbounds/addClient 新增一个或多个 client。

@@ -91,6 +91,12 @@ type Server struct {
 	dbPath     string
 
 	httpServer *http.Server
+
+	// loginLimiter 是 v0.5.3 起引入的"每 IP 登录失败计数器"——bcrypt
+	// cost=12 已是慢路径，但限流让单 IP 暴力破解的可探测密码空间在窗口
+	// 期内被强制压缩到上限次数（详见 middleware.go 中的 loginRateLimiter
+	// 注释段）。Server 持有单实例，整个进程生命周期内共享状态。
+	loginLimiter *loginRateLimiter
 }
 
 // New 构造 Server。
@@ -127,12 +133,13 @@ func New(
 		return nil, errors.New("web.New: cfg.State.Database 不可为空")
 	}
 	return &Server{
-		listenAddr: cfg.Web.ListenAddr,
-		log:        log.With("component", "web"),
-		store:      st,
-		supervisor: sup,
-		authSvc:    authSvc,
-		dbPath:     cfg.State.Database,
+		listenAddr:   cfg.Web.ListenAddr,
+		log:          log.With("component", "web"),
+		store:        st,
+		supervisor:   sup,
+		authSvc:      authSvc,
+		dbPath:       cfg.State.Database,
+		loginLimiter: newLoginRateLimiter(),
 	}, nil
 }
 
@@ -203,10 +210,19 @@ func (s *Server) Run(ctx context.Context) error {
 func (s *Server) buildMux() *http.ServeMux {
 	mux := http.NewServeMux()
 
-	// 通用中间件链（外层依次：recover → logging → handler）。
+	// 通用中间件链（外层依次：recover → logging → securityHeaders → handler）。
 	// auth / csrf 是按需追加，不放入此链。
+	//
+	// securityHeaders 放在最内层（直接调 handler 前）：在 handler 写 body 前
+	// 头部就已 set；即使 handler 自己 Set 同名 header（如 spaHandler 显式
+	// 设 Content-Type）也是直接覆盖，行为一致。
+	//
+	// 放在最外层在功能上等价——只要 securityHeaders 在 handler 调用前执行，
+	// panic 触发的 recoverMiddleware writeError 仍会写出已 set 的安全头
+	// （除非 ResponseWriter 已 committed）。选最内层是为了让职责更紧贴
+	// handler，未来若想为某个路由单独豁免安全头，包装函数改写更直观。
 	commonChain := func(h http.HandlerFunc) http.HandlerFunc {
-		return s.recoverMiddleware(s.loggingMiddleware(h))
+		return s.recoverMiddleware(s.loggingMiddleware(s.securityHeadersMiddleware(h)))
 	}
 
 	// 鉴权要求链（追加 auth）。

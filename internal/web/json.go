@@ -34,13 +34,14 @@ type apiError struct {
 //   - 全小写 + 下划线；
 //   - 用动词或形容词描述"什么不对"，而不是把 HTTP 状态翻译成中文。
 const (
-	errCodeBadRequest      = "bad_request"
-	errCodeUnauthorized    = "unauthorized"
-	errCodeForbidden       = "forbidden"
-	errCodeNotFound        = "not_found"
-	errCodeConflict        = "conflict"
-	errCodeInternal        = "internal_error"
+	errCodeBadRequest       = "bad_request"
+	errCodeUnauthorized     = "unauthorized"
+	errCodeForbidden        = "forbidden"
+	errCodeNotFound         = "not_found"
+	errCodeConflict         = "conflict"
+	errCodeInternal         = "internal_error"
 	errCodeMethodNotAllowed = "method_not_allowed"
+	errCodeTooManyRequests  = "too_many_requests"
 )
 
 // 请求体最大字节数：1 MiB。

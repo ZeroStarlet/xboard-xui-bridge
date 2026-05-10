@@ -30,24 +30,49 @@ type userResponse struct {
 //
 // 行为：
 //
+//   - 入口先做"每 IP 失败次数"限流预占——reserveAttempt 在临界区内同时
+//     检查 count + 递增，避免并发 burst 突破上限（详见 middleware.go 的
+//     loginRateLimiter 注释段）；超出 5 次/5 分钟即返 429；
 //   - 解析 body → 调 auth.Login → 写 Set-Cookie → 返回用户信息；
-//   - 失败一律 401 + ErrInvalidCredentials 文案，不区分用户名 / 密码错。
+//   - 凭据错失败 → 401 + 模糊文案；预占已经计入，无需额外动作；
+//   - 登录成功 → recordSuccess 清该 IP entry，让正常用户偶发输错后回到
+//     干净计数；
+//   - 非凭据类错误（body 解析 / 5xx 内部错） → rollbackAttempt 撤销预占，
+//     避免真用户因为服务端故障被白消耗名额。
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	if !s.loginLimiter.reserveAttempt(ip) {
+		// 仅在限流命中时打 WARN——让运维能在日志里发现暴力破解尝试，
+		// 但不打 ERROR 避免被运维监控系统误判为故障。
+		s.log.Warn("登录限流命中：IP 在窗口期内失败次数超出上限",
+			"ip", ip,
+			"max_attempts", loginRateLimitMaxAttempts,
+			"window", loginRateLimitWindow.String(),
+		)
+		s.writeError(w, http.StatusTooManyRequests, errCodeTooManyRequests,
+			"登录失败次数过多，请稍后再试")
+		return
+	}
+
 	var req loginRequest
 	if err := readJSON(r, &req); err != nil {
+		// body 解析错与暴力破解信号无关——撤销预占，避免真用户偶发坏请求被罚。
+		s.loginLimiter.rollbackAttempt(ip)
 		s.writeError(w, http.StatusBadRequest, errCodeBadRequest, "请求体格式错误")
 		return
 	}
 	username := strings.TrimSpace(req.Username)
 	if username == "" || req.Password == "" {
+		// 字段空也属于客户端误用，与凭据破解无关——撤销预占。
+		s.loginLimiter.rollbackAttempt(ip)
 		s.writeError(w, http.StatusBadRequest, errCodeBadRequest, "用户名与密码不可为空")
 		return
 	}
 
-	token, err := s.authSvc.Login(r.Context(), username, req.Password, clientIP(r), r.UserAgent())
+	token, err := s.authSvc.Login(r.Context(), username, req.Password, ip, r.UserAgent())
 	switch {
 	case err != nil && errors.Is(err, auth.ErrInvalidCredentials):
-		// 用户名或密码错。
+		// 用户名或密码错——预占已经计入，无需额外 record。
 		s.writeError(w, http.StatusUnauthorized, errCodeUnauthorized, "用户名或密码错误")
 		return
 	case err != nil && token != "":
@@ -55,11 +80,17 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		// 仅 WARN 提示运维，登录路径继续走完——把 token 还给用户避免一次"虚假失败"。
 		s.log.Warn("Login 部分成功（非致命）", "username", username, "err", err)
 	case err != nil:
-		// 致命：未拿到 token，登录确实失败。
+		// 致命：未拿到 token，登录确实失败。撤销预占——5xx 与暴力破解无关，
+		// 真用户不该因服务端故障被白消耗名额。
+		s.loginLimiter.rollbackAttempt(ip)
 		s.log.Error("Login 失败", "username", username, "err", err)
 		s.writeError(w, http.StatusInternalServerError, errCodeInternal, "服务器内部错误")
 		return
 	}
+
+	// 走到这里 = 登录成功（含"部分成功"路径）：删除该 IP entry，让该 IP
+	// 后续的输错回到干净计数。
+	s.loginLimiter.recordSuccess(ip)
 
 	// 计算 cookie maxAge：用 supervisor.Snapshot 当前生效的 cfg.Web.SessionMaxAgeHours。
 	// 不直接持有 cfg：Web 的运行时参数（如 sessionMaxAge）是由 supervisor 持有

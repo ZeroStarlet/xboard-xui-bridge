@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/auth"
@@ -40,6 +41,44 @@ func CurrentUser(ctx context.Context) *store.AdminUserRow {
 func CurrentSessionToken(ctx context.Context) string {
 	v, _ := ctx.Value(ctxKeySessionToken).(string)
 	return v
+}
+
+// securityHeadersMiddleware 给所有响应注入一组保守的浏览器侧安全响应头。
+//
+// 头部含义：
+//
+//	X-Content-Type-Options: nosniff
+//	    禁止浏览器对 Content-Type 做"猜测"——即使 handler 误把 JSON 写成
+//	    text/plain，浏览器也不会按 HTML 执行其中可能的脚本片段。配合 Vue
+//	    构建的 SPA + JSON API，本头部对正常业务零影响。
+//
+//	X-Frame-Options: DENY
+//	    禁止任何域把本面板嵌进 iframe，杜绝 clickjacking 攻击向量。运维
+//	    若需要把面板嵌入其它系统，应通过反向代理改写本头部——不在中间件
+//	    内部留 allow-list，避免误配。
+//
+//	Referrer-Policy: same-origin
+//	    跳转到外部链接时只发送同源 referer；点击 GitHub 链接等外部跳转
+//	    时不会泄漏 /api/auth/login 等内部路径。
+//
+// 设计选择：
+//
+//	a) 不写 Content-Security-Policy：本面板的前端含 Vite 注入的 inline
+//	   style，CSP 严格策略需要 hash / nonce 配合，会让首版 SPA 调试复杂。
+//	   留给未来版本（roadmap 已记录）。
+//	b) 不写 Strict-Transport-Security：HTTPS 终结大概率在反代而非中间件本身，
+//	   HSTS 应当由反代统一签发，避免双方各发一份引发浏览器困惑。
+//	c) 中间件不读 ResponseWriter 的写入状态——这些头部在 next(w, r) 之前
+//	   注入，handler 仍然可以覆盖（例如 spaHandler 自己设 Content-Type）。
+//	   若 handler 已 Write，net/http 会忽略后续 Set，不影响正确性。
+func (s *Server) securityHeadersMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "same-origin")
+		next(w, r)
+	}
 }
 
 // recoverMiddleware 捕获下游 handler 的 panic，返回 500 而不是让进程崩溃。
@@ -346,4 +385,143 @@ func (s *Server) requireMethod(w http.ResponseWriter, r *http.Request, allowed .
 	w.Header().Set("Allow", strings.Join(allowed, ", "))
 	s.writeError(w, http.StatusMethodNotAllowed, errCodeMethodNotAllowed, fmt.Sprintf("仅支持 %s", strings.Join(allowed, ", ")))
 	return false
+}
+
+// 登录失败次数限流（v0.5.3 引入）。
+//
+// 防御目标：在 bcrypt cost=12（单次 ~150ms）之外再加一道"按 IP 计数"门槛，
+// 让一对凭据 + 一个 IP 的暴力破解最多 5 次/5 分钟内拿到尝试机会。bcrypt
+// 已让单 IP 单线程每秒 ~7 次尝试，但若攻击者用并发 + 多源 IP 仍可压力
+// 测试；限流让"单 IP 内卷"变得不经济，与 fail2ban 等 OS 层防御互补
+// （OS 层覆盖跨进程持久状态，本中间件覆盖进程内即时计数）。
+//
+// 算法：固定窗口计数器 + 预占名额（reserve-then-rollback）。每个 IP 维护一个
+// (count, windowStart)；请求落在 windowStart + window 内 → 在 reserve 阶段
+// count++；超出窗口 → 重置 count=1，windowStart=now。count >= 上限时拒新
+// reserve（与代码 e.count >= loginRateLimitMaxAttempts 严格对齐）。
+//
+// 关键：reserve 必须与 count 检查在同一临界区——否则并发 burst 会让多个
+// 请求都看到 count=0、全部通过、随后再各自递增。
+//
+// 失败 / 成功语义：
+//
+//	入口 reserveAttempt(ip) → 预占一次名额；超限即返 429；
+//	登录成功 → recordSuccess(ip) 直接删除该 IP entry（让正常用户偶发输错
+//	几次后正常登录回到干净计数）；
+//	凭据错失败 → 不需要额外动作，预占已经计入；
+//	非凭据类错误（body 解析 / 服务端 5xx） → rollbackAttempt(ip) 撤销预占，
+//	避免真正用户因为服务端故障被白消耗名额。
+//
+// 状态泄漏控制：软上限 + 惰性清扫。entries 长度超 softMax 时清掉所有
+// 已过期 entry；即使大规模攻击让 map 在某个时刻接近 softMax，单次清扫
+// 是 O(N) 一次性付出，摊销到攻击周期内 < 单次 bcrypt 成本。clean 后若
+// 仍超 softMax，说明攻击规模超出中间件设计上限——按正常逻辑继续工作，
+// OS 层（iptables / fail2ban / cloudflare）应当并行兜底。
+const (
+	loginRateLimitWindow      = 5 * time.Minute
+	loginRateLimitMaxAttempts = 5
+	// loginRateLimitSoftMax 是 entries map 的软上限。超过时本次调用先清扫
+	// 已过期 entry。10000 是基于"正常运维场景下不可能积累这么多 IP"选的
+	// 经验值——若典型部署需要更高/更低，应通过 cfg 暴露而不是在此调参。
+	loginRateLimitSoftMax = 10000
+)
+
+// loginAttemptEntry 是单个 IP 的失败计数槽位。
+type loginAttemptEntry struct {
+	count       int
+	windowStart time.Time
+}
+
+// loginRateLimiter 是 IP → 失败计数的并发安全 map。
+//
+// 锁粒度：单一 sync.Mutex 包整 map。临界区只做 hash 查询 + 整型递增 + 时
+// 间比较，O(1) 极快；多 IP 并发登录失败的扩展性无压力。若未来攻击者能让
+// 锁竞争成为瓶颈，可拆分为 sharded mutex；当前 5 次/5 分钟的设计阈值下
+// 完全过设计。
+type loginRateLimiter struct {
+	mu      sync.Mutex
+	entries map[string]*loginAttemptEntry
+}
+
+// newLoginRateLimiter 构造空 limiter。Server.New 调用一次。
+func newLoginRateLimiter() *loginRateLimiter {
+	return &loginRateLimiter{entries: make(map[string]*loginAttemptEntry)}
+}
+
+// reserveAttempt 在限流允许时预占一次名额，返回 true；已超限返回 false。
+//
+// 调用约定：
+//
+//	handleLogin 入口：if !s.loginLimiter.reserveAttempt(ip) → 429
+//	登录成功 → recordSuccess(ip)（清空 entry，预占自然作废）
+//	登录凭据错失败 → 不需要额外动作，预占已计入
+//	登录非凭据类错（body 解析 / 5xx） → rollbackAttempt(ip)（撤销预占）
+//
+// 关键：count 检查与 count++ 必须在同一临界区，避免并发 burst 让多个请求
+// 都看到旧 count、全部通过 reserve、再各自递增——v0.5.3 修复 Codex 审查
+// 发现的"allow → bcrypt → record" 旧模型并发漏洞。
+func (l *loginRateLimiter) reserveAttempt(ip string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// 软上限触发清扫：超过阈值时一次性清掉所有已过期 entry。
+	// 攻击规模未到 softMax 时本路径不进，长期开销可忽略。
+	if len(l.entries) > loginRateLimitSoftMax {
+		l.pruneExpiredLocked()
+	}
+
+	now := time.Now()
+	e, ok := l.entries[ip]
+	if !ok || now.Sub(e.windowStart) >= loginRateLimitWindow {
+		// 新 IP 或窗口已过：建立新 entry，count=1（本次预占已计入）。
+		l.entries[ip] = &loginAttemptEntry{count: 1, windowStart: now}
+		return true
+	}
+	if e.count >= loginRateLimitMaxAttempts {
+		return false
+	}
+	e.count++
+	return true
+}
+
+// rollbackAttempt 撤销 reserveAttempt 预占的一次名额。仅在"非凭据类错误"
+// （body 解析失败 / 服务端 5xx）时调用，让真正的用户不因服务端故障被白
+// 消耗名额。
+//
+// 行为：count > 0 时 count--；entry 不删除——下次同 IP 来仍在同一窗口内，
+// 保留 windowStart 让"窗口期内的真实尝试时长"被准确记录（即使 rollback
+// 把 count 回到 0，也不应当让 IP 假装"窗口刚开始"）。
+func (l *loginRateLimiter) rollbackAttempt(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	e, ok := l.entries[ip]
+	if !ok {
+		// 极少见：rollback 调用之间该 entry 被并发清扫或 recordSuccess
+		// 删掉。无 entry 直接返回——预占已经"消失"，目标达成。
+		return
+	}
+	if e.count > 0 {
+		e.count--
+	}
+}
+
+// recordSuccess 在登录成功时调用，删除该 IP 的 entry——让正常用户偶发
+// 输错几次密码后成功登录不被自己历史污点限流，下次再来时是干净计数。
+func (l *loginRateLimiter) recordSuccess(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.entries, ip)
+}
+
+// pruneExpiredLocked 清扫所有已过期 entry。调用方必须已持有 l.mu。
+//
+// 单次 O(N)；摊销到 softMax 触发频率上极低，对正常请求路径无感。Go map
+// 在迭代中删除是安全的——这是 stdlib 文档明确允许的用法。
+func (l *loginRateLimiter) pruneExpiredLocked() {
+	now := time.Now()
+	for ip, e := range l.entries {
+		if now.Sub(e.windowStart) >= loginRateLimitWindow {
+			delete(l.entries, ip)
+		}
+	}
 }

@@ -40,6 +40,12 @@ var frontendFS embed.FS
 // 对于 M5 阶段 dist 仅含 placeholder index.html 的场景，所有 GET / 请求
 // 都会返回那个 placeholder——它会显示"前端尚未构建，请运行 make web"
 // 提示，让运维不至于以为 Web 面板挂了。
+//
+// 启动期缓存（v0.5.3）：index.html 在 spaHandler 构造时一次性 ReadFile 到
+// indexBytes 闭包变量，所有 SPA fallback 路由复用同一份内存切片。embed.FS
+// 的 ReadFile 是"从只读 segment 复制到新切片"操作（< KB 单次复制 + alloc），
+// 单次成本极低；但在百万级路由命中下累积的 alloc 仍会触发更多 GC——一次
+// 性 cache 让 serve 路径走零 alloc，更友好于长期运行的低带宽中间件。
 func (s *Server) spaHandler() http.HandlerFunc {
 	// 构造 dist 子文件系统：让 http.FileServer 看到的根就是 dist/，
 	// 不必每次 r.URL.Path 都加 "dist/" 前缀。
@@ -53,6 +59,25 @@ func (s *Server) spaHandler() http.HandlerFunc {
 	}
 
 	fileServer := http.FileServer(http.FS(dist))
+
+	// 启动期缓存 index.html 字节内容，避免每次 SPA fallback 都触发 fs.ReadFile
+	// 的 alloc。失败路径单独返回明确的错误 handler，让运维一眼看到"前端
+	// 尚未构建"而非模糊 500——这与原 serveSPAIndex 内的 fs.ErrNotExist
+	// 分支语义一致，只是把判定从"每次请求"前移到"启动一次"。
+	indexBytes, err := fs.ReadFile(dist, "index.html")
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			s.log.Error("dist/index.html 不存在；请运行 make web 构建前端", "err", err)
+			return func(w http.ResponseWriter, r *http.Request) {
+				s.writeError(w, http.StatusInternalServerError, errCodeInternal,
+					"dist/index.html 不存在；请运行 make web 构建前端")
+			}
+		}
+		s.log.Error("读取 dist/index.html 失败", "err", err)
+		return func(w http.ResponseWriter, r *http.Request) {
+			s.writeError(w, http.StatusInternalServerError, errCodeInternal, "读取前端资源失败")
+		}
+	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		// 仅处理 GET / HEAD；其它方法返回 405（避免 SPA 路由把 PUT 等
@@ -79,7 +104,7 @@ func (s *Server) spaHandler() http.HandlerFunc {
 			lastSeg = path[lastSlash+1:]
 		}
 		if lastSeg == "" || !strings.Contains(lastSeg, ".") {
-			s.serveSPAIndex(w, r, dist)
+			s.serveSPAIndex(w, r, indexBytes)
 			return
 		}
 
@@ -89,32 +114,22 @@ func (s *Server) spaHandler() http.HandlerFunc {
 	}
 }
 
-// serveSPAIndex 直接读取 dist/index.html 并写入响应。
+// serveSPAIndex 把启动期已 cache 的 index.html 字节写入响应。
 //
 // 不走 http.FileServer：FileServer 对 / 路径会按目录列出文件（除非有
 // index.html）；对自定义 router 路径（如 /bridges）则会返回 404。我们
-// 想要的语义是"任何 router 路径都返回 index.html"——所以手工读文件。
+// 想要的语义是"任何 router 路径都返回 index.html"——所以手工写字节流。
+//
+// indexBytes 由 spaHandler 启动期一次性 ReadFile（详见其注释），生命周期
+// 与 Server 一致；本函数仅做 io.Copy 等价的"写出 + 设头"操作，无 alloc。
 //
 // Cache-Control: no-store：M5 阶段前端会频繁迭代；让浏览器永远拉最新。
 // M8 上线稳定后可改为 stale-while-revalidate。
-func (s *Server) serveSPAIndex(w http.ResponseWriter, _ *http.Request, dist fs.FS) {
-	data, err := fs.ReadFile(dist, "index.html")
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			// 极端情况：embed 进来的 dist 居然没有 index.html。
-			// 留下明确错误信息便于排查，而不是返回模糊 404。
-			s.writeError(w, http.StatusInternalServerError, errCodeInternal,
-				"dist/index.html 不存在；请运行 make web 构建前端")
-			return
-		}
-		s.log.Error("读取 dist/index.html 失败", "err", err)
-		s.writeError(w, http.StatusInternalServerError, errCodeInternal, "读取前端资源失败")
-		return
-	}
+func (s *Server) serveSPAIndex(w http.ResponseWriter, _ *http.Request, indexBytes []byte) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
-	if _, err := w.Write(data); err != nil {
+	if _, err := w.Write(indexBytes); err != nil {
 		s.log.Error("写出 dist/index.html 失败", "err", err)
 	}
 }

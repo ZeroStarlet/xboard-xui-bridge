@@ -98,6 +98,12 @@ import (
 // 自动设 LimitIP=N"开关，让真实 IP 路径在中间件场景下可用，同时保留本
 // placeholder 兜底作为运维零配置默认值。
 func (w *bridgeWorker) syncAlive(ctx context.Context) error {
+	// 取本次 tick 的 trace 化 logger（含 loop=alive_sync + trace_id）；
+	// 详见 engine.go runStep 中的 trace_id 注入逻辑。下方 fan-out goroutine
+	// 闭包捕获 log 引用，所有"alive 拉 IP 失败" WARN 与"alive 上报完成"
+	// INFO 共享同一组 attrs。
+	log := loggerFromCtx(ctx, w.log)
+
 	traffics, err := w.xuiC.GetClientTrafficsByInboundID(ctx, w.cfg.XuiInboundID)
 	if err != nil {
 		return fmt.Errorf("拉取 inbound 流量列表（用于 alive 过滤）：%w", err)
@@ -158,7 +164,7 @@ func (w *bridgeWorker) syncAlive(ctx context.Context) error {
 			t := targets[idx]
 			raw, err := w.xuiC.GetClientIPs(ctx, t.email)
 			if err != nil {
-				w.log.Warn("alive 拉 IP 失败", "email", t.email, "err", err)
+				log.Warn("alive 拉 IP 失败", "email", t.email, "err", err)
 				return
 			}
 			ips := extractIPs(raw)
@@ -190,7 +196,7 @@ func (w *bridgeWorker) syncAlive(ctx context.Context) error {
 	if err := w.xboardC.PushAlive(ctx, w.cfg.XboardNodeID, w.cfg.XboardNodeType, alive); err != nil {
 		return fmt.Errorf("Xboard /alive：%w", err)
 	}
-	w.log.Info("alive 上报完成", "user_count", len(alive))
+	log.Info("alive 上报完成", "user_count", len(alive))
 	return nil
 }
 

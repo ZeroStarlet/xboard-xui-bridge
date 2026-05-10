@@ -368,6 +368,12 @@ func OpenSQLite(path string) (Store, error) {
 	db.SetMaxOpenConns(8)
 	db.SetMaxIdleConns(4)
 	db.SetConnMaxLifetime(time.Hour) // 防止单连接长时间空闲被 OS 杀掉。
+	// 空闲连接回收：默认 0 表示永不回收（直到 ConnMaxLifetime 到点）。本中间件
+	// 多数时间四个同步循环就足够撑满 MaxIdleConns=4 的池；但同步周期之间的
+	// 静默期可能长达 10 秒以上，期间空闲连接占着 fd 没必要。10 分钟回收阈值
+	// 比 1 小时的 lifetime 更激进——让长期闲置的连接尽快释放，同时仍远高于
+	// 60 秒同步周期，连接复用率不受影响。
+	db.SetConnMaxIdleTime(10 * time.Minute)
 
 	if _, err := db.ExecContext(pingCtx, schemaSQL); err != nil {
 		_ = db.Close()
@@ -378,7 +384,44 @@ func OpenSQLite(path string) (Store, error) {
 		return nil, fmt.Errorf("schema 迁移：%w", err)
 	}
 
+	// 文件权限收紧（v0.5.3 起）：SQLite 默认按进程 umask 创建文件，常见
+	// umask=022 会让 .db 落地为 0o644——同主机其它本地用户可读。对于
+	// 存放管理员 bcrypt hash + Xboard token + 3x-ui 密码 + session token
+	// 的库，这个权限过宽。建表完成后立刻 chmod 0o600（仅文件所有者可读写）
+	// 把面对本机旁路的暴露面收敛到与 initial_password.txt 一致。
+	//
+	// WAL 模式下 SQLite 通常会动态创建 ${path}-wal 与 ${path}-shm 两个副本
+	// （它们包含尚未写入主库的事务数据，泄漏价值与主库等同）；建表过程已
+	// 触发 WAL 写入，两个副本通常已存在——若不存在（极少边角，如纯只读 /
+	// 已 checkpoint 关闭等），helper 内部按 ENOENT 跳过即可。
+	//
+	// 边界声明：本调用是"打开时一次性硬化"，不是持续监控。SQLite 在
+	// checkpoint / 连接关闭等阶段可能重建 -wal / -shm；典型 Unix 部署下
+	// 重建会按主库现有权限（已被本调用收紧到 0o600）继承，但不构成强保证。
+	// 若运维需要更强保障，应在文件系统层面用 ACL / SELinux 兜底。
+	hardenSQLiteFilePerms(path)
+
 	return &sqliteStore{db: db}, nil
+}
+
+// hardenSQLiteFilePerms 把主库与可能存在的 -wal/-shm 副本权限收紧到 0o600。
+//
+// 三个文件分别 chmod；任意一个失败仅 best-effort（不返回错误），原因是：
+//
+//	a) Windows 下 modernc.org/sqlite 也工作但 chmod 语义被 OS 忽略——失败属于
+//	   预期行为，没必要把进程启动卡在文件权限上；
+//	b) 副本文件可能尚未存在（极少数边角：首次启动 + 同步建表 + WAL 关闭等），
+//	   不存在时 os.Chmod 返回 ENOENT，跳过即可；
+//	c) 业务功能不依赖该权限收紧——把它当作"加固而非必备"，避免误把环境差异
+//	   升级为启动失败。
+//
+// 失败仅写 stderr WARN（与 logger.cleanupArchives 同等待级），不阻断进程启动。
+func hardenSQLiteFilePerms(path string) {
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Chmod(p, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(os.Stderr, "[warn] 收紧 SQLite 文件 %q 权限失败（非致命）：%v\n", p, err)
+		}
+	}
 }
 
 // migrationStmts 列出所有"在 CREATE TABLE 后追加的字段"对应的 ALTER 语句。

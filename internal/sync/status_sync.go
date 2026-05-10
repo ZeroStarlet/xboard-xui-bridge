@@ -30,23 +30,28 @@ import (
 //	读 /proc/swaps、/proc/diskstats（Windows 节点更不可能）。统一把 swap/disk 上报
 //	为 0/0 即可——Xboard 校验只要求非负整数，业务上"未上报具体值"。
 func (w *bridgeWorker) syncStatus(ctx context.Context) error {
+	// 取本次 tick 的 trace 化 logger（含 loop=status_sync + trace_id）；
+	// 详见 engine.go runStep 中的 trace_id 注入逻辑。本函数所有 WARN /
+	// DEBUG 共享同一组 attrs，便于排查"为什么本周期降级到心跳模式"。
+	log := loggerFromCtx(ctx, w.log)
+
 	// 直接尝试从 3x-ui 拉 status；任何失败都退化为运行时心跳，不返回错误。
 	rawJSON, err := w.xuiC.GetServerStatus(ctx)
 	if err != nil {
-		w.log.Warn("拉取 3x-ui server status 失败，降级为心跳模式", "err", err)
+		log.Warn("拉取 3x-ui server status 失败，降级为心跳模式", "err", err)
 		return w.pushHeartbeat(ctx)
 	}
 
 	report, err := parseXuiStatus(rawJSON)
 	if err != nil {
-		w.log.Warn("解析 3x-ui server status 失败，降级为心跳模式", "err", err)
+		log.Warn("解析 3x-ui server status 失败，降级为心跳模式", "err", err)
 		return w.pushHeartbeat(ctx)
 	}
 
 	if err := w.xboardC.PushStatus(ctx, w.cfg.XboardNodeID, w.cfg.XboardNodeType, report); err != nil {
 		return fmt.Errorf("Xboard /status：%w", err)
 	}
-	w.log.Debug("status 上报完成", "cpu", report.CPU, "mem_used", report.Mem.Used)
+	log.Debug("status 上报完成", "cpu", report.CPU, "mem_used", report.Mem.Used)
 	return nil
 }
 
