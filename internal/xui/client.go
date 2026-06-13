@@ -8,10 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xboard-bridge/xboard-xui-bridge/internal/config"
@@ -40,14 +43,28 @@ import (
 // 并发安全：
 //
 //	a) httpClient 自带连接池天然线程安全；本 Client 不持有 cookiejar，
-//	   也不需要登录串行化锁，构造后所有字段（baseURL / apiToken）皆为
-//	   只读，多 goroutine 并发请求无 race。
+//	   也不需要登录串行化锁，apiToken 构造后只读，多 goroutine 并发请求无 race。
 //	b) listMu 保护 /list 端点的周期内合并缓存（v0.5.3 起引入），仅保护
 //	   短暂的 cache 状态读写，与请求路径无嵌套。
+//	c) baseURL 由 atomic.Pointer 包装：v0.6.x 起当 3x-ui 面板切换 cert
+//	   配置（操作员在面板侧改了 cert/key 路径、或 3x-ui 升级时 cert 路径
+//	   被脚本清理）导致监听协议在 HTTP/HTTPS 之间漂移时，client 会在首
+//	   次请求识别"协议不匹配"net/http 错误后做一次性 scheme 翻转 + 重试
+//	   （详见 do 与 schemeSwapTarget 注释）；翻转通过 CAS 保证多 goroutine
+//	   并发触发时只有第一个会真正改写 + 打 WARN，其余通过 CAS 失败回路
+//	   继续走新 baseURL 重试，不会冲突。
 type Client struct {
-	baseURL    string // host + base_path（不含尾 /）
+	// baseURL：host + base_path（不含尾 /）。v0.6.x 起允许在运行时被
+	// schemeSwapTarget 一次性翻转 scheme（http↔https）；初始化后用 Load
+	// 取快照，CAS 写以避免与并发请求的双向竞态。
+	baseURL    atomic.Pointer[string]
 	apiToken   string // Bearer 头注入值；构造后不可变
 	httpClient *http.Client
+
+	// logger：仅用于 scheme 自动翻转时的 WARN 提示。允许为 nil，此时
+	// 退化为 slog.Default()；正式部署路径上由 supervisor.buildEngine 直接
+	// 把 Supervisor.log 传进来，与其它 component 共享同一日志输出。
+	logger *slog.Logger
 
 	// /panel/api/inbounds/list 端点的周期内合并缓存（v0.5.3）。
 	//
@@ -100,7 +117,11 @@ type listFetchResult struct {
 //
 // 构造失败原因仅可能源于 TLS 配置异常——但 *http.Transport 把 TLS 错误
 // 推迟到首次请求时报告，本函数不主动检测。
-func New(cfg config.Xui) (*Client, error) {
+//
+// logger 允许为 nil（退化为 slog.Default()）；正式调用路径由
+// supervisor.buildEngine 直接传 Supervisor.log，让 scheme 自动翻转的 WARN
+// 与其它 component 日志走同一个 JSON handler。
+func New(cfg config.Xui, logger *slog.Logger) (*Client, error) {
 	transport := &http.Transport{
 		// 不直接复用 http.DefaultTransport 的两个原因：
 		//  1) SkipTLSVerify 必须按 cfg 决定；复用 default 会污染全局；
@@ -151,12 +172,38 @@ func New(cfg config.Xui) (*Client, error) {
 		Timeout:   time.Duration(cfg.TimeoutSec) * time.Second,
 	}
 
+	if logger == nil {
+		logger = slog.Default()
+	}
 	c := &Client{
-		baseURL:    cfg.APIHost + cfg.BasePath,
 		apiToken:   cfg.APIToken,
 		httpClient: httpClient,
+		// 直接复用上游 logger，不再 With("component", "xui")：项目里 component
+		// 字段在顶层只被 supervisor/web 各设置一次（sync engine 也仅追加
+		// bridge/loop/trace_id 而不重写 component），与该惯例对齐避免 JSON
+		// 输出出现重复 component 键。WARN 消息文本里已显式带 "xui" 字样
+		// 可让运维快速定位。
+		logger: logger,
 	}
+	// 初始 baseURL 入字段前先把 scheme 规一化为小写：用户在配置层填入
+	// "HTTPS://" 也合法（config.validateHTTPHost 借 url.Parse 做大小写不
+	// 敏感判定后并未回写 lower-case），但后续 schemeSwapTarget 用
+	// strings.HasPrefix 做精确比对。提前规一化避免"大写 scheme 让自动翻
+	// 转沉默失效"边角失败。
+	initial := normalizeSchemeLower(cfg.APIHost) + cfg.BasePath
+	c.baseURL.Store(&initial)
 	return c, nil
+}
+
+// normalizeSchemeLower 把 URL 字符串中的 scheme 段（"://" 前）转为小写，
+// 保留其余字符原样。raw 不含 "://" 时原样返回（既包含空串，也兼容未来
+// 异常路径，让函数无需调用方做前置非空判断）。
+func normalizeSchemeLower(raw string) string {
+	i := strings.Index(raw, "://")
+	if i <= 0 {
+		return raw
+	}
+	return strings.ToLower(raw[:i]) + raw[i:]
 }
 
 // GetInbound 调用 GET /panel/api/inbounds/get/:id 获取单个 inbound 详情。
@@ -500,24 +547,92 @@ func (c *Client) GetServerStatus(ctx context.Context) (json.RawMessage, error) {
 
 // do 是所有面板 API 共享的传输层。
 //
-// 单一正向路径：
+// 正向路径（与项目"单一正向路径"承诺一致）：
 //
 //	1. 序列化 body（如有）；
-//	2. 构造 *http.Request 并注入 Authorization: Bearer 头；
-//	3. 发送一次；
-//	4. 读响应 → 解码 commonResp → 返回 obj 或 *Error。
+//	2. 调 doOnce 用当前 baseURL 走"构造请求 → 注入 Bearer → 发 → 解码"四步；
+//	3. 成功立即返回；
+//	4. 仅当失败错误形态被 schemeSwapTarget 识别为"3x-ui 面板侧协议与
+//	   xui.api_host 配置的 scheme 不匹配"时（即 Go net/http 两条标志性
+//	   transport 错误），CAS 翻转 baseURL scheme 一次后重试一次。
 //
-// 任意一步失败立即返回 *Error；不做重试 / 重登录 / 兜底响应——这是项目
-// "单一正向路径"承诺的具体落实。
+// 为什么在此层做协议探测重试（而非更严格的"出错即失败"）：
+//
+//	a) 3x-ui 在 cert/key 路径无效或 LoadX509KeyPair 失败时静默退回 HTTP
+//	   监听（web.go:415-430），运维侧改 cert / 升级脚本误删 cert 都会让
+//	   面板从 HTTPS 退回 HTTP（反向则是 cert 配置成功 / 续期成功）；
+//	b) 此类"协议漂移"属于面板部署事实，不属于运行期临时性瞬时失败，
+//	   做一次性翻转后续请求全部走新 scheme，不构成"隐式重试 / 重登录"
+//	   的复活兜底语义；
+//	c) 翻转仅触发于两条 Go 标准库标志性 transport 错误字符串——4xx / 5xx
+//	   / success=false / 任何 HTTP 层语义错误都不触发翻转。
+//
+// 翻转语义：
+//
+//	1. 首次失败立即识别错误形态，无指数退避、无多轮 sniff；
+//	2. CAS 写：多 goroutine 并发触发时只有第一个真正改写 baseURL 并打
+//	   WARN，其它通过 CAS 失败回路直接走新 scheme 重试；
+//	3. 翻转后的重试仍然只算一次——若新 scheme 上仍报错（任何错误，无论
+//	   是否再匹配 schemeSwapTarget 条件）立即将该错误向上传播，不会出
+//	   现"http → https → http → ..." 反复抖动。
 func (c *Client) do(ctx context.Context, method, endpoint string, body any) (json.RawMessage, error) {
-	full := c.baseURL + endpoint
-
-	var bodyReader io.Reader
+	var bodyBytes []byte
 	if body != nil {
-		bodyBytes, err := json.Marshal(body)
+		var err error
+		bodyBytes, err = json.Marshal(body)
 		if err != nil {
 			return nil, fmt.Errorf("序列化 %s body：%w", endpoint, err)
 		}
+	}
+
+	baseSnap := c.baseURL.Load()
+	raw, err := c.doOnce(ctx, method, endpoint, bodyBytes, body != nil, *baseSnap)
+	if err == nil {
+		return raw, nil
+	}
+
+	newBase, ok := schemeSwapTarget(*baseSnap, err)
+	if !ok {
+		return nil, err
+	}
+
+	// CAS：只有第一个翻转者真正改写 baseURL，其余 goroutine 看到 baseSnap
+	// 已被替换，CAS 失败 → 不打 WARN，直接走新 scheme 重试。这样并发触发
+	// 时日志里只有一行 "scheme auto-switched"，避免噪音。
+	newPtr := &newBase
+	retryBase := newBase
+	if c.baseURL.CompareAndSwap(baseSnap, newPtr) {
+		c.logger.Warn("检测到 3x-ui 面板侧协议与 xui.api_host 配置不一致，自动翻转 scheme 后重试（运维侧建议同步把 xui.api_host 改为新的协议头，避免下次重启再次踩到首次失败）",
+			"module", "xui",
+			"old_base", *baseSnap,
+			"new_base", newBase,
+			"endpoint", endpoint,
+			"trigger_err", err.Error(),
+		)
+	} else {
+		// CAS 失败说明另一个 goroutine 已经写过 baseURL：通常它写的是与
+		// 本地 newBase 完全相同的值（同一段 baseSnap → schemeSwapTarget
+		// 推导是确定性的），但极端的 "A→B→A 双向反复翻转" 路径下当前
+		// 字段里的值可能已是 A（与本地 newBase 不同）。重新 Load 取真相
+		// 源保险——避免本次 retry 用陈旧本地推导覆盖新的真实状态。
+		retryBase = *c.baseURL.Load()
+	}
+
+	// 重试一次。无论结果如何都向上返回，不再做第二次翻转——避免在
+	// http/https 之间反复抖动。
+	return c.doOnce(ctx, method, endpoint, bodyBytes, body != nil, retryBase)
+}
+
+// doOnce 单次请求 + 解码；不做任何重试 / 翻转。
+//
+// 拆出独立函数是为了让 do 的"首试 → 识别 → CAS → 重试"主干清晰；
+// 失败统一抽象为 *Error（HTTPStatus=0 表示传输层错误），便于
+// schemeSwapTarget 通过类型断言而非字符串通配匹配。
+func (c *Client) doOnce(ctx context.Context, method, endpoint string, bodyBytes []byte, hasBody bool, base string) (json.RawMessage, error) {
+	full := base + endpoint
+
+	var bodyReader io.Reader
+	if hasBody {
 		bodyReader = bytes.NewReader(bodyBytes)
 	}
 
@@ -525,7 +640,7 @@ func (c *Client) do(ctx context.Context, method, endpoint string, body any) (jso
 	if err != nil {
 		return nil, fmt.Errorf("构造 %s 请求：%w", endpoint, err)
 	}
-	if body != nil {
+	if hasBody {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("Accept", "application/json")
@@ -570,6 +685,78 @@ func (c *Client) do(ctx context.Context, method, endpoint string, body any) (jso
 		}
 	}
 	return cr.Obj, nil
+}
+
+// schemeMismatchHTTPSToHTTP 是 Go 标准库 net/http 在"客户端用 HTTPS 连接
+// 纯 HTTP 服务端"时返回的固定子串。出现该串说明本端 baseURL 是 https://
+// 但 3x-ui 实际监听是 HTTP——直接翻转为 http:// 重试。
+const schemeMismatchHTTPSToHTTP = "server gave HTTP response to HTTPS client"
+
+// tlsHandshakeRecordPrefixes 列出"被 HTTP 客户端误读到响应头但首字节其实
+// 是 TLS 记录"时，Go net/textproto 用 %q 输出的合法前缀。出现以下任一前
+// 缀均强烈指向"http:// 误连接 HTTPS 服务端"。
+//
+// 字节含义（TLS 1.0+ RFC 5246/8446 ContentType + ProtocolVersion 高字节）：
+//
+//	\x14\x03 = ChangeCipherSpec, TLS 1.x
+//	\x15\x03 = Alert, TLS 1.x（server 拒绝 plain-HTTP 请求时常见的回包）
+//	\x16\x03 = Handshake (典型 ServerHello), TLS 1.x
+//	\x17\x03 = ApplicationData, TLS 1.x
+//
+// 选这四个字节而非更宽的 `malformed HTTP response` 子串匹配，避免坏代理 /
+// SSH banner / 错端口的 SMTP/POP3 greeting / MITM 乱字节等误把"非 scheme
+// drift"映射成 scheme 翻转。Codex 审核 (2026-06-13) 明确要求收紧该判定。
+var tlsHandshakeRecordPrefixes = []string{
+	`malformed HTTP response "\x14\x03`,
+	`malformed HTTP response "\x15\x03`,
+	`malformed HTTP response "\x16\x03`,
+	`malformed HTTP response "\x17\x03`,
+}
+
+// looksLikeTLSRecordOnHTTP 判定 msg 是否带任一 TLS record 特征前缀。
+// 任一命中即返回 true；零命中返回 false。供 schemeSwapTarget 使用。
+func looksLikeTLSRecordOnHTTP(msg string) bool {
+	for _, p := range tlsHandshakeRecordPrefixes {
+		if strings.Contains(msg, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// schemeSwapTarget 判定当前 base 与 err 是否构成"协议不匹配"语义；
+// 若是，返回翻转 scheme 后的新 base 与 true，调用方据此 CAS 写 + 重试。
+//
+// 返回 (newBase, true) 的条件（两两必须同时满足）：
+//
+//	a) err 是本包 *Error 且 HTTPStatus==0（即传输层错误，不是 HTTP 响应
+//	   层的 4xx/5xx——后者意味着 server 已正常应答 HTTP，scheme 必然匹
+//	   配，纯粹业务 / 鉴权问题应继续传播让运维介入）；
+//	b) err.Msg 命中 schemeMismatchHTTPSToHTTP 且 base 以 https:// 开头；
+//	   或命中 looksLikeTLSRecordOnHTTP 且 base 以 http:// 开头。
+//
+// 注意 3x-ui 在 HTTP→HTTPS 端口上更常见的服务端反应是直接 RST / EOF，
+// 此时 client 拿到的会是 "connection reset" / "EOF" 类错误，本中间件不
+// 在该类无歧义错误上做翻转——它们也可能是网络层瞬时抖动，盲翻转会让
+// "短暂掉线"被错误地映射成"协议变了"造成不必要的状态切换。
+//
+// 其它任何错误（DNS 解析失败 / connection refused / timeout / EOF /
+// TLS 证书校验失败 / commonResp.success=false 等）一律不翻转，向上原样
+// 传播——这与项目"单一正向路径"承诺保持一致：scheme 翻转只针对"3x-ui
+// 面板端协议监听漂移"这一个明确根因，不做泛化的连通性试探。
+func schemeSwapTarget(base string, err error) (string, bool) {
+	var xe *Error
+	if !errors.As(err, &xe) || xe.HTTPStatus != 0 {
+		return "", false
+	}
+	msg := xe.Msg
+	switch {
+	case strings.HasPrefix(base, "https://") && strings.Contains(msg, schemeMismatchHTTPSToHTTP):
+		return "http://" + strings.TrimPrefix(base, "https://"), true
+	case strings.HasPrefix(base, "http://") && looksLikeTLSRecordOnHTTP(msg):
+		return "https://" + strings.TrimPrefix(base, "http://"), true
+	}
+	return "", false
 }
 
 // truncate 把字符串截到最多 max 字节，超长部分用 "…" 标记，便于日志阅读。

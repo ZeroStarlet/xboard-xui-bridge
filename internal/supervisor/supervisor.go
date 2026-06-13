@@ -278,7 +278,10 @@ func (s *Supervisor) startLocked(cfg *config.Root) error {
 // 可以"先构造，发现错误就立刻返回；构造成功再杀旧启新"。
 func (s *Supervisor) buildEngine(cfg *config.Root) (*syncengine.Engine, error) {
 	xboardC := xboard.New(cfg.Xboard)
-	xuiC, err := xui.New(cfg.Xui)
+	// 把 Supervisor 的 logger 直传进 xui.Client：client 内部仅在 scheme
+	// 自动翻转时打一行 WARN（详见 internal/xui/client.go do/Schemeswap
+	// 注释），共享同一个 JSON handler 便于运维侧统一聚合。
+	xuiC, err := xui.New(cfg.Xui, s.log)
 	if err != nil {
 		return nil, fmt.Errorf("初始化 3x-ui 客户端：%w", err)
 	}
